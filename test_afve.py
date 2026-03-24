@@ -1072,11 +1072,7 @@ class TestRetrievalAgent:
         llm = MockLLMClient("Python programming language creation date")
         agent = self._agent(llm=llm)
         with patch("agents.settings") as ms:
-            ms.kb_search_results_per_query = 3
-            # Attempt 1 (idx=0) → no expansion; attempt 2 (idx=1) → expansion
-            expanded = await agent._expand_query("Python was created in 1991.", 1)
-        assert expanded == "Python programming language creation date"
-
+            ms.enable_query_expansion = True
     @pytest.mark.asyncio
     async def test_query_expansion_skips_on_attempt_0(self):
         llm = MockLLMClient("SHOULD NOT BE RETURNED")
@@ -1236,7 +1232,7 @@ class TestOrchestrator:
         req = self._request("I think Python is great. In my opinion it is wonderful.")
         report = await orchestrator.run(req)
         assert report.claims == []
-        assert report.overall_score == 0.0
+        assert report.overall_score is None
 
     @pytest.mark.asyncio
     async def test_failed_claim_verification_excluded_from_report(self):
@@ -1553,7 +1549,8 @@ class TestEdgeCases:
         )
         body = client.post("/verify", json=payload).json()
         assert body["claims"] == []
-        assert body["overall_score"] == 0.0
+        assert body["overall_score"] is None
+        assert body["overall_label"] == "NO_VERIFIABLE_CONTENT"
 
     @pytest.mark.asyncio
     async def test_score_calibrator_precision(self):

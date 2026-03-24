@@ -184,9 +184,9 @@ def _get_nli_pipeline():
         try:
             from transformers import pipeline  # type: ignore
             _nli_pipeline = pipeline(
-                "zero-shot-classification",
+                "text-classification",
                 model=settings.nli_model_name,
-                device="cpu",
+                device=-1,  # CPU
             )
             logger.info("NLI loaded: %s", settings.nli_model_name)
         except Exception as exc:
@@ -416,6 +416,8 @@ class RelationalDecomposer:
         )
 
     async def _extract_triple_llm(self, text: str) -> RelationalTriple | None:
+        if not settings.enable_llm_triple_extraction:
+            return None
         system = (
             "Extract the relational triple from this factual claim.\n"
             "Return ONLY valid JSON: "
@@ -1000,7 +1002,7 @@ class RetrievalAgent:
 
     async def _expand_query(self, original_query: str, attempt_idx: int) -> str:
         """Expand query on retries using the LLM (attempt_idx >= 1)."""
-        if attempt_idx <= 0 or not self._llm:
+        if attempt_idx <= 0 or not self._llm or not settings.enable_query_expansion:
             return original_query
 
         system = (
@@ -1167,13 +1169,12 @@ class VerificationEngine:
         if nli is None:
             return _heuristic_nli(hypothesis, evidence)
         try:
-            result = nli(
-                evidence[:512],
-                candidate_labels=["entailment", "contradiction", "neutral"],
-                hypothesis_template="The following statement is factually true: {}",
-                multi_label=False,
+            results = nli(
+                {"text": evidence[:512], "text_pair": hypothesis},
+                top_k=None
             )
-            sc = dict(zip(result["labels"], result["scores"]))
+            # TextClassification pipeline with top_k=None returns list of dicts.
+            sc = {r["label"].lower(): r["score"] for r in results}
             ent = sc.get("entailment", 0.0)
             con = sc.get("contradiction", 0.0)
             neu = sc.get("neutral", 0.5)

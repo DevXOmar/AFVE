@@ -263,7 +263,9 @@ class Settings(BaseSettings):
     metrics_port: int = 9090
     job_store_ttl_seconds: int = 3_600
 
-    enable_coreference_resolution: bool = True
+    enable_coreference_resolution: bool = False
+    enable_query_expansion: bool = False
+    enable_llm_triple_extraction: bool = False
     enable_semantic_cache: bool = True
     enable_reranker: bool = True
 
