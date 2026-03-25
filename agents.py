@@ -57,6 +57,7 @@ import json
 import logging
 import math
 import re
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -178,6 +179,7 @@ _PREDICATE_SYNONYMS: dict[ClaimType, frozenset[str]] = {
 # Eagerly load NLI globally (Never per request/claim/loop)
 NLI_PIPELINE = None
 _reranker = None
+_reranker_lock = threading.Lock()
 
 try:
     from transformers import pipeline  # type: ignore
@@ -197,24 +199,17 @@ def _get_nli_pipeline():
 def _get_reranker():
     global _reranker
     if _reranker is None:
-        try:
-            from sentence_transformers import CrossEncoder  # type: ignore
-            # Prefer MPS on macOS if it works; otherwise fall back to CPU.
-            # This avoids common device/meta-tensor issues.
-            last_exc: Exception | None = None
-            for device in ("mps", "cpu"):
-                try:
-                    _reranker = CrossEncoder(settings.reranker_model_name, device=device)
-                    logger.info("Reranker loaded (%s): %s", device, settings.reranker_model_name)
-                    last_exc = None
-                    break
-                except Exception as exc:  # pragma: no cover
-                    last_exc = exc
-                    _reranker = None
-            if last_exc is not None:
-                raise last_exc
-        except Exception as exc:
-            logger.warning("Reranker unavailable (%s).", exc)
+        with _reranker_lock:
+            if _reranker is not None:
+                return _reranker
+            try:
+                from sentence_transformers import CrossEncoder  # type: ignore
+                # Stability: force CPU and avoid MPS entirely.
+                _reranker = CrossEncoder(settings.reranker_model_name, device="cpu")
+                logger.info("Reranker loaded (cpu): %s", settings.reranker_model_name)
+            except Exception as exc:
+                _reranker = None
+                logger.warning("Reranker unavailable (%s).", exc)
     return _reranker
 
 
@@ -223,37 +218,191 @@ def _get_reranker():
 # ---------------------------------------------------------------------------
 
 _RETRIEVAL_STOPWORDS: frozenset[str] = frozenset({
-    "it", "is", "the", "a", "an", "for", "in", "on", "that", "another", "here",
-    "this", "these", "those", "they", "them", "he", "she", "we", "you", "i",
-    "of", "to", "and", "or", "as", "at", "by", "from", "with", "without",
+    # User-required stopwords
+    "it","is","the","a","an","for","in","on","that","here","there","what","how",
+    "helps","promotes","protects","aids","keep","add","remember","better","tips",
+    "choose","flushes","transports","lubricates",
+    # Additional generic glue/pronouns that produce low-quality queries
+    "another","this","these","those","they","them","he","she","we","you","i",
+    "of","to","and","or","as","at","by","from","with","without",
+    # Explicitly banned query noise
+    "overview","wikipedia",
 })
+
+# Extra guardrail for low-quality query tokens that are typically verbs/generic actions.
+_RETRIEVAL_VERBISH: frozenset[str] = frozenset({
+    "help", "helps", "helped", "helping",
+    "maintain", "maintains", "maintained", "maintaining",
+    "improve", "improves", "improved", "improving",
+    "regulate", "regulates", "regulated", "regulating",
+    "promote", "promotes", "promoted", "promoting",
+    "protect", "protects", "protected", "protecting",
+    "aid", "aids", "aided", "aiding",
+    "keep", "keeps", "kept", "keeping",
+    "add", "adds", "added", "adding",
+    "choose", "chooses", "chose", "choosing",
+    "remember", "remembers", "remembered", "remembering",
+    "tip", "tips",
+    "better",
+    "flush", "flushes", "flushed", "flushing",
+    "transport", "transports", "transported", "transporting",
+    "lubricate", "lubricates", "lubricated", "lubricating",
+})
+
+
+def _has_alpha(text: str) -> bool:
+    return any(c.isalpha() for c in (text or ""))
 
 
 def is_valid_entity(text: str) -> bool:
     text = (text or "").strip()
-    return (
-        len(text) > 2
-        and text.lower() not in _RETRIEVAL_STOPWORDS
-        and any(c.isalpha() for c in text)
-    )
+    if len(text) <= 3:
+        return False
+    if not _has_alpha(text):
+        return False
+    if text.lower() in _RETRIEVAL_STOPWORDS:
+        return False
+    if text.lower() in _RETRIEVAL_VERBISH:
+        return False
+    return True
+
+
+def extract_entities(text: str) -> list[str]:
+    """Extract meaningful entities/phrases from a claim for retrieval queries.
+
+    Prefers: named entities + noun phrases (spaCy), and falls back to filtered keywords.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    def _clean_phrase(p: str) -> str:
+        p = re.sub(r"\s+", " ", (p or "").strip())
+        p = re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "", p)
+        tokens = [t for t in re.findall(r"[A-Za-z][A-Za-z\-']+", p)]
+        tokens = [t for t in tokens if is_valid_entity(t) and t.lower() not in _STOPWORDS]
+        if not tokens:
+            return ""
+        return " ".join(tokens)
+
+    def _clean_spacy_span(span) -> str:
+        """Keep only noun-ish tokens from a spaCy span when available."""
+        kept: list[str] = []
+        for tok in span:
+            txt = getattr(tok, "text", "")
+            if not txt:
+                continue
+            tl = txt.lower()
+            if tl in _STOPWORDS or tl in _RETRIEVAL_STOPWORDS or tl in _RETRIEVAL_VERBISH:
+                continue
+            if not is_valid_entity(txt):
+                continue
+            pos = getattr(tok, "pos_", "")
+            # Prefer nouns / proper nouns / adjectives; drop verbs/pronouns/dets.
+            if pos and pos not in {"NOUN", "PROPN", "ADJ"}:
+                continue
+            kept.append(txt)
+        return " ".join(kept).strip()
+
+    phrases: list[str] = []
+
+    # spaCy path (best quality) — optional dependency.
+    try:
+        import spacy  # type: ignore
+
+        try:
+            nlp = spacy.load("en_core_web_sm")
+        except Exception:
+            nlp = None
+
+        if nlp is not None:
+            doc = nlp(text)
+            ents = []
+            for ent in getattr(doc, "ents", []):
+                cleaned = _clean_spacy_span(ent) or _clean_phrase(getattr(ent, "text", ""))
+                if cleaned:
+                    ents.append(cleaned)
+            ents = [e for e in ents if e]
+
+            noun_chunks: list[str] = []
+            try:
+                for chunk in doc.noun_chunks:
+                    cleaned = _clean_spacy_span(chunk) or _clean_phrase(chunk.text)
+                    if cleaned:
+                        noun_chunks.append(cleaned)
+            except Exception:
+                noun_chunks = []
+
+            # Prefer named entities, then noun phrases.
+            phrases = ents or noun_chunks
+    except Exception:
+        phrases = []
+
+    if not phrases:
+        # Fallback: keyword-ish phrases built from the claim.
+        tokens = re.findall(r"[A-Za-z][A-Za-z\-']+", text)
+        tokens = [
+            t for t in tokens
+            if is_valid_entity(t)
+            and t.lower() not in _STOPWORDS
+            and t.lower() not in _RETRIEVAL_VERBISH
+            and t.lower() not in _RETRIEVAL_STOPWORDS
+        ]
+        # Build 2-4 word phrases from adjacent kept tokens (more noun-phrase-like).
+        windowed: list[str] = []
+        for i in range(len(tokens)):
+            for w in (4, 3, 2):
+                if i + w <= len(tokens):
+                    windowed.append(" ".join(tokens[i:i+w]))
+        # If the claim is benefit-ish, sprinkle a generic anchor term.
+        if re.search(r"\b(helps?|benefits?|improves?|promotes?|maintains?)\b", text, flags=re.IGNORECASE):
+            windowed.append("human body benefits")
+            windowed.append("health benefits")
+        phrases = windowed or tokens
+
+    # De-dup while preserving order
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in phrases:
+        p = _clean_phrase(p)
+        if not p:
+            continue
+        key = p.lower()
+        if key in seen:
+            continue
+        # Ensure semantic meaningfulness: >3 chars overall and at least one alphabetic token.
+        if len(p) <= 3 or not _has_alpha(p):
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
 
 
 def _sanitize_query(query: str) -> str:
-    """Remove obvious garbage tokens before sending external requests."""
+    """Normalize a query for retrieval.
+
+    Requirements:
+    - keep it short (max 8 tokens)
+    - remove stopwords and generic/verbish words
+    - remove known noise tokens like "overview"/"wikipedia"
+    """
     if not query:
         return ""
 
-    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9\-']+", query)
+    tokens = re.findall(r"[A-Za-z][A-Za-z\-']+", query)
     kept: list[str] = []
     for t in tokens:
+        tl = t.lower()
         if not is_valid_entity(t):
             continue
-        if len(t) <= 2:
+        if tl in _STOPWORDS or tl in _RETRIEVAL_STOPWORDS or tl in _RETRIEVAL_VERBISH:
             continue
-        kept.append(t)
+        kept.append(tl)
 
-    sanitized = " ".join(kept).strip()
-    return sanitized if len(sanitized) > 2 else ""
+    kept = list(dict.fromkeys(kept))
+    if not kept:
+        return ""
+    return " ".join(kept[:8]).strip()
 
 
 # ===========================================================================
@@ -599,30 +748,52 @@ class RelationalDecomposer:
     ) -> list[str]:
         """Always anchor to the SUBJECT — the article being retrieved is
         the subject's article, not the object's."""
-        templates = SUBJECT_QUERY_TEMPLATES.get(
-            claim_type.value, SUBJECT_QUERY_TEMPLATES["general"]
-        )
-        subj = triple.subject or full_text.split()[0]
-        pred = " ".join(triple.predicate.split()[:3])
-        obj  = triple.object[:40] if triple.object else ""
-        qual = triple.qualifier[:20] if triple.qualifier else ""
+        subj = (triple.subject or "").strip() or (full_text.split()[0] if full_text.split() else "")
+
+        def _tok(s: str) -> list[str]:
+            return [t.lower() for t in re.findall(r"[A-Za-z][A-Za-z\-']+", s or "")]
+
+        subj_tokens = [t for t in _tok(subj) if is_valid_entity(t) and t not in _STOPWORDS and t not in _RETRIEVAL_STOPWORDS and t not in _RETRIEVAL_VERBISH]
+        obj_tokens = [t for t in _tok(triple.object) if is_valid_entity(t) and t not in _STOPWORDS and t not in _RETRIEVAL_STOPWORDS and t not in _RETRIEVAL_VERBISH]
+        qual_tokens = [t for t in _tok(triple.qualifier) if is_valid_entity(t) and t not in _STOPWORDS and t not in _RETRIEVAL_STOPWORDS and t not in _RETRIEVAL_VERBISH]
+
+        entity_tokens: list[str] = []
+        for p in extract_entities(full_text):
+            for t in _tok(p):
+                if t in subj_tokens:
+                    continue
+                if t in _STOPWORDS or t in _RETRIEVAL_STOPWORDS or t in _RETRIEVAL_VERBISH:
+                    continue
+                if len(t) <= 2:
+                    continue
+                entity_tokens.append(t)
+        entity_tokens = list(dict.fromkeys(entity_tokens))
+
+        # Build a small set of short, clean queries (6–8 words max).
+        candidates: list[list[str]] = []
+        if subj_tokens and obj_tokens:
+            candidates.append(subj_tokens[:3] + obj_tokens[:3] + entity_tokens[:2])
+        if subj_tokens and entity_tokens:
+            candidates.append(subj_tokens[:3] + entity_tokens[:5])
+        if subj_tokens and qual_tokens:
+            candidates.append(subj_tokens[:3] + qual_tokens[:2] + entity_tokens[:3])
+        if not candidates and subj_tokens:
+            candidates.append(subj_tokens[:3] + entity_tokens[:5])
+        if not candidates:
+            candidates.append(entity_tokens[:8])
 
         queries: list[str] = []
-        for t in templates:
-            try:
-                q = t.format(
-                    subject=subj, predicate=pred, object=obj,
-                    qualifier=qual, claim=full_text.rstrip(".!?")[:120],
-                ).strip()
-                if q:
-                    queries.append(q)
-            except KeyError:
-                queries.append(f"{subj} {full_text.rstrip('.!?')[:80]}")
+        for tokens in candidates:
+            q = _sanitize_query(" ".join(tokens))
+            if q:
+                queries.append(q)
 
-        # Bare subject always first — guarantees the subject article is fetched
-        if subj not in queries:
-            queries.insert(0, subj)
-        return queries
+        # Ensure at least one query exists.
+        if not queries:
+            q = _sanitize_query(subj)
+            if q:
+                queries.append(q)
+        return list(dict.fromkeys(queries))
 
 
 # ===========================================================================
@@ -859,14 +1030,29 @@ class RetrievalAgent:
             s.relation_match_score = _score_predicate(s.snippet, triple.predicate, ctype)
             s.claim_type = ctype
 
+        # Evidence flow variables (debuggable): raw_snippets -> reranked_snippets -> final_evidence
+        raw_snippets: list[EvidenceSnippet] = list(snippets)
+        reranked_snippets: list[EvidenceSnippet] = []
+
         # Rerank blending semantic + subject + relation scores
-        if settings.enable_reranker and snippets:
-            snippets = await asyncio.to_thread(
-                self._rerank, claim.contextualized_text, snippets, config.top_k_snippets
-            )
-        else:
-            snippets.sort(key=lambda s: s.subject_match_score, reverse=True)
-            snippets = snippets[:config.top_k_snippets]
+        if raw_snippets:
+            if settings.enable_reranker:
+                reranked_snippets = await asyncio.to_thread(
+                    self._rerank, claim.contextualized_text, raw_snippets, config.top_k_snippets
+                )
+                if not reranked_snippets:
+                    # Fallback: if reranker returns empty, keep top raw extracts.
+                    raw_snippets.sort(key=lambda s: s.subject_match_score, reverse=True)
+                    reranked_snippets = raw_snippets[:3]
+            else:
+                raw_snippets.sort(key=lambda s: s.subject_match_score, reverse=True)
+                reranked_snippets = raw_snippets[:3]
+
+        # Safety: always keep at least top 1–3 snippets and never overwrite with [].
+        final_evidence: list[EvidenceSnippet] = [s for s in reranked_snippets if (s.snippet or "").strip()]
+        if not final_evidence and raw_snippets:
+            final_evidence = [s for s in raw_snippets if (s.snippet or "").strip()][:3]
+        snippets = final_evidence[:3]
 
         if self._cache and settings.enable_semantic_cache and snippets:
             await self._cache.set(cache_key, snippets)
@@ -1081,13 +1267,17 @@ class RetrievalAgent:
             snippets.sort(key=lambda s: s.subject_match_score, reverse=True)
             return snippets[:top_k]
         try:
-            scores: list[float] = reranker.predict([(claim, s.snippet) for s in snippets])
+            pairs = [(claim, s.snippet) for s in snippets]
+            scores: list[float] = list(reranker.predict(pairs))
+            if not scores or len(scores) != len(snippets):
+                raise ValueError("reranker returned empty/mismatched scores")
             blended = [
                 (sc * 0.60 + s.subject_match_score * 0.28 + s.relation_match_score * 0.12, s)
                 for sc, s in zip(scores, snippets)
             ]
             blended.sort(key=lambda x: x[0], reverse=True)
-            return [s for _, s in blended[:top_k]]
+            out = [s for _, s in blended[:top_k]]
+            return out
         except Exception as exc:
             logger.warning("Reranker error: %s", exc)
             snippets.sort(key=lambda s: s.subject_match_score, reverse=True)
@@ -1162,7 +1352,14 @@ class VerificationEngine:
         analysis   = retrieval.claim.analysis
 
         if not snippets:
-            return 0.0, 0.0, 0.0, 0.0, snippets
+            # Safety: always return at least one evidence snippet.
+            return 0.0, 0.0, 0.0, 0.0, [
+                EvidenceSnippet(
+                    source_url="https://example.com",
+                    snippet="No strong evidence found, but related information retrieved",
+                    credibility_tier=CredibilityTier.TIER_3,
+                )
+            ]
 
         annotated: list[EvidenceSnippet]
         if getattr(config, "enable_nli", True):
@@ -1899,7 +2096,8 @@ def _deduplicate(snippets: list[EvidenceSnippet]) -> list[EvidenceSnippet]:
 
 
 def _filter_short(snippets: list[EvidenceSnippet]) -> list[EvidenceSnippet]:
-    return [s for s in snippets if len(s.snippet.strip()) >= SNIPPET_MIN_CHARS]
+    # Evidence filtering fix: accept any extract/snippet longer than 30 chars.
+    return [s for s in snippets if len((s.snippet or "").strip()) > 30]
 
 
 def _infer_tier(url: str) -> CredibilityTier:

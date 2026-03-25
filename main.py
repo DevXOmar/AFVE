@@ -172,6 +172,17 @@ async def verify_sync(
     logger.info("[%s] Sync verification started.", payload.job_id)
     start  = time.monotonic()
     report = await orchestrator.run(payload)
+
+    # Debug + safety: ensure evidence isn't lost after retrieval.
+    try:
+        for c in report.claims:
+            ev_texts = [getattr(e, "snippet", "") for e in (c.evidence or [])]
+            ev_texts = [t for t in ev_texts if isinstance(t, str) and t.strip()]
+            if not ev_texts:
+                ev_texts = ["No evidence available"]
+            print("FINAL EVIDENCE:", ev_texts[:3])
+    except Exception:
+        pass
     elapsed = int((time.monotonic() - start) * 1000)
     _update_metrics(report, elapsed)
     logger.info(
@@ -242,6 +253,17 @@ async def run_ollama_then_verify(
         config=payload.config,
     )
     report = await orchestrator.run(req)
+
+    # Debug + safety: ensure evidence isn't lost after retrieval.
+    try:
+        for c in report.claims:
+            ev_texts = [getattr(e, "snippet", "") for e in (c.evidence or [])]
+            ev_texts = [t for t in ev_texts if isinstance(t, str) and t.strip()]
+            if not ev_texts:
+                ev_texts = ["No evidence available"]
+            print("FINAL EVIDENCE:", ev_texts[:3])
+    except Exception:
+        pass
     elapsed = int((time.monotonic() - start) * 1000)
     _update_metrics(report, elapsed)
 

@@ -40,7 +40,7 @@ from enum import Enum
 from typing import Annotated, Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +305,22 @@ class EvidenceSnippet(BaseModel):
     numeric_result: ComparisonResult = ComparisonResult.NOT_FOUND
 
     claim_type: ClaimType = ClaimType.GENERAL
+
+    # ------------------------------------------------------------------
+    # Frontend compatibility fields
+    # ------------------------------------------------------------------
+
+    @computed_field(return_type=str)
+    @property
+    def text(self) -> str:
+        # UI components expect `text`; backend uses `snippet`.
+        return self.snippet
+
+    @computed_field(return_type=str)
+    @property
+    def url(self) -> str:
+        # UI components expect `url`; backend uses `source_url`.
+        return self.source_url
 
     @field_validator("source_url")
     @classmethod
