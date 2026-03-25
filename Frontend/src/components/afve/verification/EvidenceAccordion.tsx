@@ -2,9 +2,11 @@ import React, { useState } from "react";
 import { ChevronDown, ChevronUp, Link as LinkIcon } from "lucide-react";
 
 interface Evidence {
-  text: string;
+  text?: string;
+  snippet?: string;
   source?: string;
   url?: string;
+  source_url?: string;
   score?: number;
 }
 
@@ -31,13 +33,13 @@ export function EvidenceAccordion({ evidence }: EvidenceAccordionProps) {
         <div className="mt-2 space-y-2">
           {evidence.map((ev, i) => (
             <div key={i} className="bg-slate-50 p-3 rounded-md border border-slate-100 text-sm">
-              <p className="text-slate-700 leading-relaxed mb-2">"{ev.text}"</p>
+              <p className="text-slate-700 leading-relaxed mb-2">"{ev.text || ev.snippet}"</p>
               
-              {(ev.url || ev.source) && (
+              {(ev.url || ev.source || ev.source_url) && (
                 <div className="flex items-center gap-1.5 text-xs text-blue-600 font-medium overflow-hidden">
                   <LinkIcon className="w-3 h-3 flex-shrink-0" />
-                  <a href={ev.url || "#"} target="_blank" rel="noreferrer" className="truncate hover:underline">
-                    {ev.url || ev.source}
+                  <a href={ev.url || ev.source_url || "#"} target="_blank" rel="noreferrer" className="truncate hover:underline">
+                    {ev.url || ev.source || ev.source_url}
                   </a>
                 </div>
               )}

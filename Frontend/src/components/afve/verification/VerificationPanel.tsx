@@ -1,11 +1,14 @@
 import React, { useEffect, useState } from "react";
-import { X, Search } from "lucide-react";
+import { X, Search, ExternalLink, CheckCircle, AlertTriangle, XCircle } from "lucide-react";
 import { ClaimCard } from "./ClaimCard";
 
 interface AFVEReport {
   claims: any[];
+  global_evidence?: any[];
   overall_score?: number;
-  label?: string;
+  overall_label?: string;
+  factuality_percentage?: number;
+  factuality_rating?: string;
 }
 
 interface VerificationPanelProps {
@@ -43,8 +46,8 @@ export function VerificationPanel({ isOpen, onClose, isLoading, report }: Verifi
   const hasClaims = report?.claims && report.claims.length > 0;
   
   const stats = hasClaims ? {
-    supported: report.claims.filter(c => c.label === "SUPPORTED").length,
-    inconclusive: report.claims.filter(c => c.label === "INCONCLUSIVE").length,
+    supported: report.claims.filter(c => c.label === "VERIFIED").length,
+    inconclusive: report.claims.filter(c => c.label === "UNCERTAIN" || c.label === "UNSUPPORTED").length,
     contradicted: report.claims.filter(c => c.label === "CONTRADICTED").length,
   } : { supported: 0, inconclusive: 0, contradicted: 0 };
 
@@ -98,6 +101,20 @@ export function VerificationPanel({ isOpen, onClose, isLoading, report }: Verifi
             </div>
           ) : (
             <div className="space-y-6 animate-in slide-in-from-bottom-4 duration-500">
+              <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+                <div className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Overall Factuality</div>
+                <div className="flex items-end justify-between gap-4">
+                  <div>
+                    <div className="text-3xl font-bold text-slate-900">
+                      {report.factuality_percentage !== undefined ? `${report.factuality_percentage}%` : `${((report.overall_score || 0) * 100).toFixed(1)}%`}
+                    </div>
+                    <div className="text-sm text-slate-500 mt-1">
+                      {report.factuality_rating || report.overall_label || "Uncertain"}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center justify-between">
                 <div className="text-center flex-1 border-r border-slate-100">
                   <div className="text-2xl font-bold text-emerald-600">{stats.supported}</div>
@@ -125,6 +142,34 @@ export function VerificationPanel({ isOpen, onClose, isLoading, report }: Verifi
                   </div>
                 ))}
               </div>
+              {report.global_evidence && report.global_evidence.length > 0 && (
+                <div className="space-y-3 mt-8">
+                  <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">Top Evidence</h4>
+                  <div className="space-y-3">
+                    {report.global_evidence.map((ev, idx) => (
+                      <div key={idx} className="bg-white border border-slate-200 rounded-lg p-3 text-sm flex gap-3 shadow-sm">
+                        <div className="mt-0.5">
+                          {ev.entailment_status === 'supports' ? (
+                            <CheckCircle className="w-4 h-4 text-emerald-500" />
+                          ) : ev.entailment_status === 'contradicts' ? (
+                            <XCircle className="w-4 h-4 text-rose-500" />
+                          ) : (
+                            <AlertTriangle className="w-4 h-4 text-amber-500" />
+                          )}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-slate-700 leading-snug mb-1.5">{ev.snippet}</p>
+                          <a href={ev.simple_url || ev.source_url} target="_blank" rel="noreferrer" className="text-xs text-indigo-600 hover:text-indigo-800 transition-colors inline-flex items-center gap-1 max-w-full">
+                            <ExternalLink className="w-3 h-3 flex-shrink-0" />
+                            <span className="truncate">{ev.source_url}</span>
+                          </a>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
             </div>
           )}
         </div>

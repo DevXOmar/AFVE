@@ -302,6 +302,8 @@ class EvidenceSnippet(BaseModel):
     subject_match_score: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0
     object_match_score: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0
     relation_match_score: Annotated[float, Field(ge=0.0, le=1.0)] = 0.5
+    # Semantic match strength between claim and evidence (used for scoring).
+    semantic_score: Annotated[float, Field(ge=0.0)] = 0.0
     numeric_result: ComparisonResult = ComparisonResult.NOT_FOUND
 
     claim_type: ClaimType = ClaimType.GENERAL
@@ -321,6 +323,31 @@ class EvidenceSnippet(BaseModel):
     def url(self) -> str:
         # UI components expect `url`; backend uses `source_url`.
         return self.source_url
+
+    @computed_field(return_type=str)
+    @property
+    def pair_classification(self) -> str:
+        """3-way claim↔evidence classification.
+
+        - SUPPORTS: same meaning
+        - CONTRADICTS: opposite meaning (high-confidence)
+        - IRRELEVANT: low similarity / generic / unrelated
+
+        We keep EntailmentStatus as-is for backward compatibility.
+        """
+        sem = 0.0
+        try:
+            sem = float(self.semantic_score)
+        except Exception:
+            sem = 0.0
+
+        if sem < 0.35:
+            return "IRRELEVANT"
+        if self.entailment_status == EntailmentStatus.SUPPORTS:
+            return "SUPPORTS"
+        if self.entailment_status == EntailmentStatus.CONTRADICTS:
+            return "CONTRADICTS"
+        return "IRRELEVANT"
 
     @field_validator("source_url")
     @classmethod
@@ -357,6 +384,8 @@ class VerifiedClaim(BaseModel):
     entities: list[EntitySpan] = Field(default_factory=list)
     numeric_assertions: list[NumericAssertion] = Field(default_factory=list)
     numeric_comparison: ComparisonResult = ComparisonResult.NOT_FOUND
+    top_supporting_evidence: list[EvidenceSnippet] = Field(default_factory=list)
+    top_contradicting_evidence: list[EvidenceSnippet] = Field(default_factory=list)
 
     subject_validated: bool = False   # subject found in ≥1 snippet
     relation_verified: bool = False   # predicate confirmed in evidence
@@ -368,6 +397,16 @@ class VerifiedClaim(BaseModel):
     source_weight_component: Annotated[float, Field(ge=0.0, le=1.0)] = 0.0
     cross_source_agreement: Annotated[float, Field(ge=0.0, le=1.0)] = 0.0
     numeric_score_component: Annotated[float, Field(ge=0.0, le=1.0)] = 0.5
+
+    @computed_field(return_type=str)
+    @property
+    def claim_text(self) -> str:
+        return self.claim
+
+    @computed_field(return_type=float)
+    @property
+    def confidence_score(self) -> float:
+        return self.score
 
 
 class JobMetadata(BaseModel):
@@ -391,6 +430,10 @@ class VerificationReport(BaseModel):
     claims: list[VerifiedClaim]
     reasoning: str | None = None
     uncertainty_signals: dict[str, Any] = Field(default_factory=dict)
+    global_evidence: list[EvidenceSnippet] = Field(default_factory=list)
+    factuality_percentage: Annotated[float | None, Field(ge=0.0, le=100.0)] = None
+    factuality_rating: str | None = None
+    sources_used: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def populate_uncertainty_signals(self) -> VerificationReport:
@@ -421,6 +464,20 @@ class VerificationReport(BaseModel):
             ),
             "claim_type_breakdown": type_breakdown,
         }
+        if self.overall_score is not None:
+            self.factuality_percentage = round(self.overall_score * 100.0, 1)
+            self.factuality_rating = _score_to_rating(self.factuality_percentage)
+        else:
+            self.factuality_percentage = None
+            self.factuality_rating = None
+
+        sources: list[str] = []
+        seen = set()
+        for ev in self.global_evidence:
+            if ev.source_url not in seen:
+                seen.add(ev.source_url)
+                sources.append(ev.source_url)
+        self.sources_used = sources
         return self
 
 
@@ -477,6 +534,18 @@ def _variance(values: list[float]) -> float:
         return 0.0
     mean = sum(values) / len(values)
     return sum((v - mean) ** 2 for v in values) / len(values)
+
+
+def _score_to_rating(score_percent: float | None) -> str | None:
+    if score_percent is None:
+        return None
+    if score_percent < 30.0:
+        return "Likely Incorrect"
+    if score_percent < 60.0:
+        return "Uncertain"
+    if score_percent < 85.0:
+        return "Moderately Reliable"
+    return "Highly Reliable"
 
 class OllamaGenerateRequest(BaseModel):
     model: str

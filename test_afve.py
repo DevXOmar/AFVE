@@ -576,15 +576,17 @@ class TestScoringCalibrator:
         cal = self._cal()
         base = dict(source_url="https://example.com", snippet="x", credibility_tier=CredibilityTier.TIER_1)
 
-        supports = EvidenceSnippet(**base, entailment_status=EntailmentStatus.SUPPORTS)
-        contradicts = EvidenceSnippet(**base, entailment_status=EntailmentStatus.CONTRADICTS)
-        neutral = EvidenceSnippet(**base, entailment_status=EntailmentStatus.NEUTRAL)
+        # New scoring: semantic-weighted supports/contradictions on top evidence.
+        supports = EvidenceSnippet(**base, entailment_status=EntailmentStatus.SUPPORTS, semantic_score=1.0)
+        contradicts = EvidenceSnippet(**base, entailment_status=EntailmentStatus.CONTRADICTS, semantic_score=1.0)
+        neutral = EvidenceSnippet(**base, entailment_status=EntailmentStatus.NEUTRAL, semantic_score=1.0)
 
         assert cal.compute_claim_score(ClaimScoreInput(nli=1.0, has_evidence=True, evidence=[supports])) == pytest.approx(1.0)
-        assert cal.compute_claim_score(ClaimScoreInput(nli=0.1, has_evidence=True, evidence=[supports])) == pytest.approx(0.8)
-        assert cal.compute_claim_score(ClaimScoreInput(nli=0.9, has_evidence=True, evidence=[contradicts])) == pytest.approx(0.2)
+        assert cal.compute_claim_score(ClaimScoreInput(nli=0.1, has_evidence=True, evidence=[supports])) == pytest.approx(1.0)
+        assert cal.compute_claim_score(ClaimScoreInput(nli=0.9, has_evidence=True, evidence=[contradicts])) == pytest.approx(0.0)
         assert cal.compute_claim_score(ClaimScoreInput(nli=0.9, has_evidence=True, evidence=[neutral])) == pytest.approx(0.5)
-        assert cal.compute_claim_score(ClaimScoreInput(nli=0.9, has_evidence=False, evidence=[])) == pytest.approx(0.0)
+        # Default: inconclusive when evidence is absent.
+        assert cal.compute_claim_score(ClaimScoreInput(nli=0.9, has_evidence=False, evidence=[])) == pytest.approx(0.5)
 
     def test_label_highly_factual(self):
         cal = self._cal()
@@ -598,13 +600,13 @@ class TestScoringCalibrator:
 
     def test_label_uncertain(self):
         cal = self._cal()
-        assert cal.score_to_label(0.39).value == "CONTRADICTED"
+        assert cal.score_to_label(0.39).value == "UNCERTAIN"
         assert cal.score_to_label(0.20).value == "CONTRADICTED"
 
     def test_label_likely_hallucinated(self):
         cal = self._cal()
         assert cal.score_to_label(0.01).value == "CONTRADICTED"
-        assert cal.score_to_label(0.0).value == "UNSUPPORTED"
+        assert cal.score_to_label(0.0).value == "CONTRADICTED"
 
     def test_overall_score_average_no_penalty(self):
         from models import VerifiedClaim, VerificationLabel

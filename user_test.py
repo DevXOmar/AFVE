@@ -66,13 +66,25 @@ def run_test(prompt):
     result = verify_with_afve(prompt, answer)
     
     print("\n📊 AFVE RESULT:")
-    print(f"Overall Score: {result.get('overall_score')}\n")
+    percent = result.get("factuality_percentage")
+    rating = result.get("factuality_rating")
+    if percent is not None:
+        print(f"Overall: {percent}% factual")
+        if rating:
+            print(f"Rating: {rating}")
+    else:
+        print(f"Overall Score: {result.get('overall_score')}")
+    print()
     
     if result.get("claims"):
         for claim in result["claims"]:
             print(f"• Claim: {claim['claim']}")
-            print(f"  Score: {claim['score']} ({claim['label']})")
+            print(f"  Score: {round(claim['score'] * 100, 1)}% ({claim['label']})")
             print(f"  Explanation: {claim['explanation']}")
+            if claim.get("evidence"):
+                top = claim["evidence"][0]
+                print(f"  Top Evidence: {top.get('snippet')}")
+                print(f"  Source: {top.get('source_url')}")
             print("-"*40)
     else:
         print("No claims detected or invalid input.")
