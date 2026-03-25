@@ -46,9 +46,9 @@ export function VerificationPanel({ isOpen, onClose, isLoading, report }: Verifi
   const hasClaims = report?.claims && report.claims.length > 0;
   
   const stats = hasClaims ? {
-    supported: report.claims.filter(c => c.label === "VERIFIED").length,
+    supported: report.claims.filter(c => c.label === "VERIFIED" || c.label === "MOSTLY_TRUE").length,
     inconclusive: report.claims.filter(c => c.label === "UNCERTAIN" || c.label === "UNSUPPORTED").length,
-    contradicted: report.claims.filter(c => c.label === "CONTRADICTED").length,
+    contradicted: report.claims.filter(c => c.label === "CONTRADICTED" || c.label === "LIKELY_FALSE").length,
   } : { supported: 0, inconclusive: 0, contradicted: 0 };
 
   return (

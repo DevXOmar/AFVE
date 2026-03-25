@@ -5,15 +5,15 @@ import { EvidenceAccordion } from "./EvidenceAccordion";
 interface Claim {
   claim?: string;
   claim_text?: string;
-  label: "VERIFIED" | "UNCERTAIN" | "UNSUPPORTED" | "CONTRADICTED";
+  label: "VERIFIED" | "MOSTLY_TRUE" | "UNCERTAIN" | "UNSUPPORTED" | "CONTRADICTED" | "LIKELY_FALSE";
   confidence_score?: number;
   evidence: Array<{ text?: string; snippet?: string; source?: string; url?: string; source_url?: string; score?: number }>;
 }
 
 export function ClaimCard({ claim }: { claim: Claim }) {
-  const isSupported = claim.label === "VERIFIED";
+  const isSupported = claim.label === "VERIFIED" || claim.label === "MOSTLY_TRUE";
   const isInconclusive = claim.label === "UNCERTAIN" || claim.label === "UNSUPPORTED";
-  const isContradicted = claim.label === "CONTRADICTED";
+  const isContradicted = claim.label === "CONTRADICTED" || claim.label === "LIKELY_FALSE";
 
   return (
     <div className="bg-white rounded-lg border border-slate-200 shadow-sm p-4 overflow-hidden transform transition-all duration-300 translate-y-0 opacity-100">
@@ -25,7 +25,7 @@ export function ClaimCard({ claim }: { claim: Claim }) {
         <div className="flex flex-col items-end shrink-0 gap-1 mt-0.5">
           {isSupported && (
             <span className="flex items-center gap-1 text-xs font-semibold text-emerald-700 bg-emerald-50 px-2 py-1 rounded-full border border-emerald-100">
-              <CheckCircle className="w-3 h-3" /> Supported
+              <CheckCircle className="w-3 h-3" /> {claim.label === "MOSTLY_TRUE" ? "Mostly True" : "Verified"}
             </span>
           )}
           {isInconclusive && (
@@ -35,7 +35,7 @@ export function ClaimCard({ claim }: { claim: Claim }) {
           )}
           {isContradicted && (
             <span className="flex items-center gap-1 text-xs font-semibold text-rose-700 bg-rose-50 px-2 py-1 rounded-full border border-rose-100">
-              <XCircle className="w-3 h-3" /> Contradicted
+              <XCircle className="w-3 h-3" /> {claim.label === "LIKELY_FALSE" ? "Likely False" : "Contradicted"}
             </span>
           )}
           

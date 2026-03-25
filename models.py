@@ -50,6 +50,8 @@ from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validat
 
 class VerificationLabel(str, Enum):
     VERIFIED = "VERIFIED"
+    MOSTLY_TRUE = "MOSTLY_TRUE"
+    LIKELY_FALSE = "LIKELY_FALSE"
     UNCERTAIN = "UNCERTAIN"
     UNSUPPORTED = "UNSUPPORTED"
     CONTRADICTED = "CONTRADICTED"
@@ -59,6 +61,7 @@ class VerificationLabel(str, Enum):
 
 class EntailmentStatus(str, Enum):
     SUPPORTS = "supports"
+    WEAK_SUPPORT = "weak_support"
     CONTRADICTS = "contradicts"
     NEUTRAL = "neutral"
 
@@ -345,6 +348,8 @@ class EvidenceSnippet(BaseModel):
             return "IRRELEVANT"
         if self.entailment_status == EntailmentStatus.SUPPORTS:
             return "SUPPORTS"
+        if self.entailment_status == EntailmentStatus.WEAK_SUPPORT:
+            return "WEAK_SUPPORT"
         if self.entailment_status == EntailmentStatus.CONTRADICTS:
             return "CONTRADICTS"
         return "IRRELEVANT"
@@ -539,13 +544,13 @@ def _variance(values: list[float]) -> float:
 def _score_to_rating(score_percent: float | None) -> str | None:
     if score_percent is None:
         return None
-    if score_percent < 30.0:
-        return "Likely Incorrect"
-    if score_percent < 60.0:
+    if score_percent >= 85.0:
+        return "VERIFIED"
+    if score_percent >= 65.0:
+        return "MOSTLY_TRUE"
+    if score_percent >= 40.0:
         return "Uncertain"
-    if score_percent < 85.0:
-        return "Moderately Reliable"
-    return "Highly Reliable"
+    return "LIKELY_FALSE"
 
 class OllamaGenerateRequest(BaseModel):
     model: str

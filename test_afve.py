@@ -585,28 +585,28 @@ class TestScoringCalibrator:
         assert cal.compute_claim_score(ClaimScoreInput(nli=0.1, has_evidence=True, evidence=[supports])) == pytest.approx(1.0)
         assert cal.compute_claim_score(ClaimScoreInput(nli=0.9, has_evidence=True, evidence=[contradicts])) == pytest.approx(0.0)
         assert cal.compute_claim_score(ClaimScoreInput(nli=0.9, has_evidence=True, evidence=[neutral])) == pytest.approx(0.5)
-        # Default: inconclusive when evidence is absent.
-        assert cal.compute_claim_score(ClaimScoreInput(nli=0.9, has_evidence=False, evidence=[])) == pytest.approx(0.5)
+        # No evidence maps to unsupported.
+        assert cal.compute_claim_score(ClaimScoreInput(nli=0.9, has_evidence=False, evidence=[])) == pytest.approx(0.2)
 
     def test_label_highly_factual(self):
         cal = self._cal()
         assert cal.score_to_label(0.95).value == "VERIFIED"
-        assert cal.score_to_label(0.80).value == "VERIFIED"
+        assert cal.score_to_label(0.86).value == "VERIFIED"
 
     def test_label_partially_correct(self):
         cal = self._cal()
-        assert cal.score_to_label(0.74).value == "UNCERTAIN"
-        assert cal.score_to_label(0.40).value == "UNCERTAIN"
+        assert cal.score_to_label(0.74).value == "MOSTLY_TRUE"
+        assert cal.score_to_label(0.65).value == "MOSTLY_TRUE"
 
     def test_label_uncertain(self):
         cal = self._cal()
-        assert cal.score_to_label(0.39).value == "UNCERTAIN"
-        assert cal.score_to_label(0.20).value == "CONTRADICTED"
+        assert cal.score_to_label(0.50).value == "UNCERTAIN"
+        assert cal.score_to_label(0.40).value == "UNCERTAIN"
 
     def test_label_likely_hallucinated(self):
         cal = self._cal()
-        assert cal.score_to_label(0.01).value == "CONTRADICTED"
-        assert cal.score_to_label(0.0).value == "CONTRADICTED"
+        assert cal.score_to_label(0.30).value == "LIKELY_FALSE"
+        assert cal.score_to_label(0.0).value == "UNSUPPORTED"
 
     def test_overall_score_average_no_penalty(self):
         from models import VerifiedClaim, VerificationLabel
@@ -624,7 +624,7 @@ class TestScoringCalibrator:
             claim(0.7, VerificationLabel.UNCERTAIN),
         ]
         score = cal.compute_overall_score(claims)
-        assert score == pytest.approx(0.8, abs=1e-4)
+        assert score == pytest.approx(0.75, abs=1e-4)
 
     def test_overall_score_never_below_zero(self):
         from models import VerifiedClaim, VerificationLabel
@@ -1398,7 +1398,7 @@ class TestSyncEndpoint:
     def test_response_has_overall_label(self, client):
         body = client.post("/verify", json=minimal_request()).json()
         assert body["overall_label"] in [
-            "VERIFIED", "UNCERTAIN", "UNSUPPORTED", "CONTRADICTED", "NO_VERIFIABLE_CONTENT", "UNKNOWN"
+            "VERIFIED", "MOSTLY_TRUE", "UNCERTAIN", "LIKELY_FALSE", "UNSUPPORTED", "CONTRADICTED", "NO_VERIFIABLE_CONTENT", "UNKNOWN"
         ]
 
     def test_response_has_claims_list(self, client):

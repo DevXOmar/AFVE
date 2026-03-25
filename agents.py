@@ -1398,7 +1398,7 @@ class VerificationEngine:
                 for s in annotated
             ])
 
-            sup = sum(1 for s in annotated if s.entailment_status == EntailmentStatus.SUPPORTS)
+            sup = sum(1 for s in annotated if s.entailment_status in {EntailmentStatus.SUPPORTS, EntailmentStatus.WEAK_SUPPORT})
             con = sum(1 for s in annotated if s.entailment_status == EntailmentStatus.CONTRADICTS)
             n = len(annotated)
             cross_agreement = 0.0 if n == 0 else ((sup - con) / n + 1.0) / 2.0
@@ -1429,13 +1429,9 @@ class VerificationEngine:
                 return True
             return False
 
-        def _lexical_semantic(claim: str, sent: str) -> float:
-            tok = lambda t: [x for x in re.findall(r"[a-z0-9]+", (t or "").lower()) if x and x not in _STOPWORDS]
-            a = set(tok(claim))
-            b = set(tok(sent))
-            if not a or not b:
-                return 0.0
-            return len(a & b) / max(len(a), 1)
+        triple = analysis.triple if analysis else RelationalTriple()
+        key_terms = _claim_key_terms(claim_text, triple)
+        required_subject = (triple.subject or "").strip()
 
         # Use top-K evidence, but match at sentence-level.
         top_snippets = list(snippets[:3])
@@ -1444,51 +1440,41 @@ class VerificationEngine:
             for sent in _split_sentences(s.snippet):
                 if _is_generic_sentence(sent):
                     continue
+                if not _sentence_is_candidate(sent, required_subject, key_terms):
+                    continue
                 candidates.append((s, sent))
 
         if not candidates:
             # Fallback: use the original snippets as candidates.
             for s in top_snippets:
-                if (s.snippet or "").strip():
-                    candidates.append((s, (s.snippet or "").strip()))
+                sentence = (s.snippet or "").strip()
+                if sentence and _sentence_is_candidate(sentence, required_subject, key_terms, allow_relaxed=True):
+                    candidates.append((s, sentence))
 
-        # Rank candidates by semantic match (reranker if available; else lexical overlap).
-        reranker = _get_reranker() if settings.enable_reranker else None
-        scored: list[tuple[float, EvidenceSnippet, str]] = []
-        if reranker is not None:
-            try:
-                pairs = [(claim_text, sent) for _, sent in candidates]
-                rscores = list(reranker.predict(pairs))
-                # Normalize to [0, 1] with a sigmoid to keep thresholds sane across models.
-                norm = [1.0 / (1.0 + math.exp(-float(x))) for x in rscores]
-                for (parent, sent), sem in zip(candidates, norm):
-                    scored.append((float(sem), parent, sent))
-            except Exception:
-                scored = [(float(_lexical_semantic(claim_text, sent)), parent, sent) for parent, sent in candidates]
-        else:
-            scored = [(float(_lexical_semantic(claim_text, sent)), parent, sent) for parent, sent in candidates]
-
+        scored: list[tuple[float, EvidenceSnippet, str]] = [
+            (_candidate_alignment_score(claim_text, sent, triple), parent, sent)
+            for parent, sent in candidates
+        ]
         scored.sort(key=lambda x: x[0], reverse=True)
         top_pairs = scored[:5]
 
         # Build final evidence snippets (top 3 sentences) and score each.
         selected: list[EvidenceSnippet] = []
-        for sem, parent, sent in top_pairs:
+        for alignment, parent, sent in top_pairs:
             ev = EvidenceSnippet(
                 source_url=parent.source_url,
                 snippet=sent,
                 credibility_tier=parent.credibility_tier,
-                subject_match_score=parent.subject_match_score,
-                object_match_score=parent.object_match_score,
-                relation_match_score=parent.relation_match_score,
+                subject_match_score=max(parent.subject_match_score, _score_presence(sent, triple.subject)),
+                object_match_score=max(parent.object_match_score, _score_presence(sent, triple.object)),
+                relation_match_score=max(parent.relation_match_score, _score_predicate(sent, triple.predicate, parent.claim_type)),
                 claim_type=parent.claim_type,
-                semantic_score=float(max(0.0, sem)),
+                semantic_score=float(max(0.0, alignment)),
             )
             selected.append(ev)
 
         annotated: list[EvidenceSnippet]
         if getattr(config, "enable_nli", True):
-            triple = analysis.triple if analysis else RelationalTriple()
             nli_hyp = _build_hypothesis(triple, claim_text)
             import asyncio
             tasks = [asyncio.to_thread(self._score_snippet_sync, nli_hyp, s) for s in selected]
@@ -1496,7 +1482,12 @@ class VerificationEngine:
             
             # Sort by NLI score (if SUPPORTS, score + 1.0) and semantic score.
             def _sort_key(snip: EvidenceSnippet) -> float:
-                status_mult = 1.0 if snip.entailment_status == EntailmentStatus.SUPPORTS else (0.5 if snip.entailment_status == EntailmentStatus.NEUTRAL else 0.0)
+                status_mult = {
+                    EntailmentStatus.SUPPORTS: 1.0,
+                    EntailmentStatus.WEAK_SUPPORT: 0.8,
+                    EntailmentStatus.NEUTRAL: 0.5,
+                    EntailmentStatus.CONTRADICTS: 0.0,
+                }.get(snip.entailment_status, 0.0)
                 sem = getattr(snip, "semantic_score", 0.0)
                 return float(snip.nli_score + status_mult + sem)
             
@@ -1507,7 +1498,11 @@ class VerificationEngine:
             annotated = selected[:3]
 
         # Only let strong semantic matches influence the aggregate.
-        strong = [s for s in annotated if getattr(s, "semantic_score", 0.0) >= 0.45]
+        strong = [
+            s for s in annotated
+            if s.entailment_status in {EntailmentStatus.SUPPORTS, EntailmentStatus.WEAK_SUPPORT}
+            or getattr(s, "semantic_score", 0.0) >= 0.45
+        ]
         nli_agg = _mean([s.nli_score for s in (strong or annotated)])
         llm_agg = 0.0 # Disabled
         
@@ -1517,7 +1512,7 @@ class VerificationEngine:
             for s in annotated
         ])
 
-        sup = sum(1 for s in annotated if s.entailment_status == EntailmentStatus.SUPPORTS)
+        sup = sum(1 for s in annotated if s.entailment_status in {EntailmentStatus.SUPPORTS, EntailmentStatus.WEAK_SUPPORT})
         con = sum(1 for s in annotated if s.entailment_status == EntailmentStatus.CONTRADICTS)
         n = len(annotated)
         cross_agreement = 0.0 if n == 0 else ((sup - con) / n + 1.0) / 2.0
@@ -1595,6 +1590,7 @@ class VerificationEngine:
                     sem = float(sem)
                 except Exception:
                     sem = 0.0
+                keyword_overlap = _keyword_overlap_ratio(nli_hyp, snippet.snippet)
 
                 decisive_threshold = 0.65 if sem >= 0.60 else 0.85
                 if sem < 0.35 or subject_match < min_subject_match_for_decision:
@@ -1610,7 +1606,11 @@ class VerificationEngine:
                     else:
                         status = EntailmentStatus.NEUTRAL
                 else:
-                    status = EntailmentStatus.NEUTRAL
+                    if subject_match >= 0.75 and keyword_overlap >= 0.35:
+                        status = EntailmentStatus.WEAK_SUPPORT
+                        score = max(score, 0.70)
+                    else:
+                        status = EntailmentStatus.NEUTRAL
             except Exception as e:
                 logger.warning(f"NLI failure: {e}")
                 status = EntailmentStatus.NEUTRAL
@@ -1756,45 +1756,50 @@ class ScoringCalibrator:
     def compute_claim_score(self, claim: ClaimScoreInput) -> float:
         """Return a deterministic normalized score in [0, 1]."""
         if not claim.has_evidence or not claim.evidence:
-            return 0.5
+            return 0.2
 
         top = list(claim.evidence[:3])
         supports = any(s.entailment_status == EntailmentStatus.SUPPORTS for s in top)
+        weak_supports = any(s.entailment_status == EntailmentStatus.WEAK_SUPPORT for s in top)
         contradicts = any(s.entailment_status == EntailmentStatus.CONTRADICTS for s in top)
+        neutrals = any(s.entailment_status == EntailmentStatus.NEUTRAL for s in top)
 
-        if contradicts and not supports:
-            return 0.0
         if supports:
             return 1.0
-        return 0.5
+        if weak_supports:
+            return 0.7
+        if contradicts:
+            return 0.0
+        if neutrals:
+            return 0.5
+        return 0.2
 
     def compute_overall_score(self, claims: list[VerifiedClaim]) -> float:
         if not claims:
             return 0.0
         canonical = {
             VerificationLabel.VERIFIED: 1.0,
+            VerificationLabel.MOSTLY_TRUE: 0.7,
             VerificationLabel.UNCERTAIN: 0.5,
+            VerificationLabel.LIKELY_FALSE: 0.0,
             VerificationLabel.CONTRADICTED: 0.0,
-            VerificationLabel.UNSUPPORTED: 0.0,
+            VerificationLabel.UNSUPPORTED: 0.2,
             VerificationLabel.UNKNOWN: 0.0,
             VerificationLabel.NO_VERIFIABLE_CONTENT: 0.0,
         }
-        if all(abs(c.score - canonical.get(c.label, c.score)) < 1e-9 for c in claims):
-            verified = sum(1 for c in claims if c.label == VerificationLabel.VERIFIED)
-            uncertain = sum(1 for c in claims if c.label == VerificationLabel.UNCERTAIN)
-            total = len(claims)
-            score = (verified + 0.5 * uncertain) / total
-            return round(max(min(score, 1.0), 0.0), 4)
-
-        base_score = sum(c.score for c in claims) / max(len(claims), 1)
+        base_score = sum(canonical.get(c.label, c.score) for c in claims) / max(len(claims), 1)
         return round(max(min(base_score, 1.0), 0.0), 4)
 
     def score_to_label(self, score: float) -> VerificationLabel:
-        if score >= 0.75:
+        if score >= 0.85:
             return VerificationLabel.VERIFIED
-        if score < 0.30:
-            return VerificationLabel.CONTRADICTED
-        return VerificationLabel.UNCERTAIN
+        if score >= 0.65:
+            return VerificationLabel.MOSTLY_TRUE
+        if score >= 0.40:
+            return VerificationLabel.UNCERTAIN
+        if score <= 0.20:
+            return VerificationLabel.UNSUPPORTED
+        return VerificationLabel.LIKELY_FALSE
 
 
 
@@ -1828,7 +1833,7 @@ class ExplanationGenerator:
         if not snippets:
             return f"{triple_str} — No supporting evidence found for this claim. Treating as unverified."
 
-        sup_snips = [s for s in snippets if s.entailment_status == EntailmentStatus.SUPPORTS]
+        sup_snips = [s for s in snippets if s.entailment_status in {EntailmentStatus.SUPPORTS, EntailmentStatus.WEAK_SUPPORT}]
         con_snips = [s for s in snippets if s.entailment_status == EntailmentStatus.CONTRADICTS]
         tier1     = [s for s in snippets if s.credibility_tier == CredibilityTier.TIER_1]
         subj_ok   = [s for s in snippets if s.subject_match_score >= SUBJECT_MATCH_THRESHOLD]
@@ -1851,6 +1856,11 @@ class ExplanationGenerator:
                 f"Verified by {len(sup_snips)} evidence sentence(s)"
                 + (f", including {len(tier1)} high-authority source(s)" if tier1 else "")
                 + f". Subject match {len(subj_ok)}/{len(snippets)}; relation match {len(rel_ok)}/{len(snippets)}."
+            )
+        elif label == VerificationLabel.MOSTLY_TRUE:
+            parts.append(
+                f"Evidence partially aligns with the claim and was upgraded to weak support. "
+                f"Support={len(sup_snips)}, contradiction={len(con_snips)}."
             )
         elif label == VerificationLabel.UNCERTAIN:
             parts.append(
@@ -2060,7 +2070,7 @@ class VerificationOrchestrator:
         # Rank by NLI output and credibility
         def _global_sort(e):
             score = e.nli_score + getattr(e, "semantic_score", 0.0)
-            if e.entailment_status == EntailmentStatus.SUPPORTS:
+            if e.entailment_status in {EntailmentStatus.SUPPORTS, EntailmentStatus.WEAK_SUPPORT}:
                 score += 2.0
             elif e.entailment_status == EntailmentStatus.CONTRADICTS:
                 score += 1.0
@@ -2109,7 +2119,7 @@ class VerificationOrchestrator:
 
                 numeric_result = _best_numeric_result(annotated)
                 top_evidence = _rank_claim_evidence(annotated)[:3]
-                supporting = [s for s in top_evidence if s.entailment_status == EntailmentStatus.SUPPORTS][:3]
+                supporting = [s for s in top_evidence if s.entailment_status in {EntailmentStatus.SUPPORTS, EntailmentStatus.WEAK_SUPPORT}][:3]
                 contradicting = [s for s in top_evidence if s.entailment_status == EntailmentStatus.CONTRADICTS][:3]
                 has_relevant_evidence = bool(top_evidence)
 
@@ -2229,6 +2239,7 @@ def _build_hypothesis(triple: RelationalTriple, fallback: str) -> str:
 def _evidence_rank_score(snippet: EvidenceSnippet) -> float:
     entailment_bonus = {
         EntailmentStatus.SUPPORTS: 1.0,
+        EntailmentStatus.WEAK_SUPPORT: 0.8,
         EntailmentStatus.NEUTRAL: 0.35,
         EntailmentStatus.CONTRADICTS: 0.9,
     }.get(snippet.entailment_status, 0.0)
@@ -2244,6 +2255,59 @@ def _evidence_rank_score(snippet: EvidenceSnippet) -> float:
         + entailment_bonus
         + credibility_bonus
     )
+
+
+def _content_tokens(text: str) -> list[str]:
+    return [
+        t for t in re.findall(r"[a-z0-9]+", (text or "").lower())
+        if t and t not in _STOPWORDS and len(t) > 2
+    ]
+
+
+def _keyword_overlap_ratio(claim_text: str, evidence_text: str) -> float:
+    claim_tokens = set(_content_tokens(claim_text))
+    evidence_tokens = set(_content_tokens(evidence_text))
+    if not claim_tokens or not evidence_tokens:
+        return 0.0
+    return len(claim_tokens & evidence_tokens) / max(len(claim_tokens), 1)
+
+
+def _claim_key_terms(claim_text: str, triple: RelationalTriple) -> set[str]:
+    tokens = set(_content_tokens(claim_text))
+    tokens.update(_content_tokens(triple.predicate))
+    tokens.update(_content_tokens(triple.object))
+    tokens.update(_content_tokens(triple.qualifier))
+    return tokens
+
+
+def _subject_match_ratio(subject: str, sentence: str) -> float:
+    if not subject:
+        return 1.0
+    return _score_presence(sentence, subject)
+
+
+def _sentence_is_candidate(
+    sentence: str,
+    subject: str,
+    key_terms: set[str],
+    allow_relaxed: bool = False,
+) -> bool:
+    subject_match = _subject_match_ratio(subject, sentence)
+    if subject and subject_match < (0.5 if allow_relaxed else 0.75):
+        return False
+    overlap = len(set(_content_tokens(sentence)) & key_terms)
+    return overlap >= (1 if allow_relaxed else 2)
+
+
+def _candidate_alignment_score(claim_text: str, sentence: str, triple: RelationalTriple) -> float:
+    overlap = _keyword_overlap_ratio(claim_text, sentence)
+    subject_score = _subject_match_ratio(triple.subject, sentence)
+    predicate_score = _score_predicate(sentence, triple.predicate, ClaimType.GENERAL)
+    numeric_bonus = 0.0
+    if triple.qualifier and _content_tokens(triple.qualifier):
+        numeric_bonus = 0.20 if any(tok in set(_content_tokens(sentence)) for tok in _content_tokens(triple.qualifier)) else 0.0
+    generic_penalty = 0.25 if re.search(r"\bis\s+(an?|the)\b", sentence.lower()) and predicate_score < 0.7 else 0.0
+    return max(0.0, overlap * 0.45 + subject_score * 0.30 + predicate_score * 0.25 + numeric_bonus - generic_penalty)
 
 
 def _rank_claim_evidence(snippets: list[EvidenceSnippet]) -> list[EvidenceSnippet]:
@@ -2271,13 +2335,16 @@ def _claim_label_from_evidence(
         return VerificationLabel.UNSUPPORTED
 
     supports = [e for e in evidence if e.entailment_status == EntailmentStatus.SUPPORTS]
+    weak_supports = [e for e in evidence if e.entailment_status == EntailmentStatus.WEAK_SUPPORT]
     contradicts = [e for e in evidence if e.entailment_status == EntailmentStatus.CONTRADICTS]
     neutrals = [e for e in evidence if e.entailment_status == EntailmentStatus.NEUTRAL]
 
-    if contradicts and not supports:
-        return VerificationLabel.CONTRADICTED
     if supports:
         return VerificationLabel.VERIFIED
+    if weak_supports:
+        return VerificationLabel.MOSTLY_TRUE
+    if contradicts and not (supports or weak_supports):
+        return VerificationLabel.LIKELY_FALSE
     if neutrals:
         return VerificationLabel.UNCERTAIN
     return VerificationLabel.UNSUPPORTED
