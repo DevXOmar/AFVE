@@ -368,7 +368,7 @@ def _update_metrics(report: VerificationReport, elapsed_ms: int) -> None:
 
     _metrics["total_hallucinated_claims"] = (
         int(_metrics["total_hallucinated_claims"])
-        + sum(1 for c in report.claims if c.label == VerificationLabel.LIKELY_HALLUCINATED)
+        + sum(1 for c in report.claims if c.label == VerificationLabel.CONTRADICTED)
     )
     _metrics["total_no_evidence_claims"] = (
         int(_metrics["total_no_evidence_claims"])

@@ -249,7 +249,7 @@ class TestModels:
                 claim="test",
                 contextualized_claim="test",
                 score=1.1,
-                label=VerificationLabel.HIGHLY_FACTUAL,
+                label=VerificationLabel.VERIFIED,
                 explanation="ok",
                 evidence=[],
             )
@@ -283,15 +283,15 @@ class TestModels:
                 claims_verified=3,
             ),
             overall_score=0.6,
-            overall_label=VerificationLabel.PARTIALLY_CORRECT,
+            overall_label=VerificationLabel.UNCERTAIN,
             claims=[
-                _claim(0.9, VerificationLabel.HIGHLY_FACTUAL),
+                _claim(0.9, VerificationLabel.VERIFIED),
                 _claim(0.3, VerificationLabel.UNCERTAIN),
-                _claim(0.1, VerificationLabel.LIKELY_HALLUCINATED),
+                _claim(0.1, VerificationLabel.CONTRADICTED),
             ],
         )
         sig = report.uncertainty_signals
-        assert sig["hallucinated_claim_count"] == 1
+        assert sig["contradicted_by_label_count"] == 1
         assert sig["uncertain_claim_count"] == 1
         assert sig["min_claim_score"] == pytest.approx(0.1)
         assert "score_variance" in sig
@@ -332,7 +332,7 @@ class TestModels:
     def test_enums_are_string_serialisable(self):
         from models import VerificationLabel, EntailmentStatus, JobStatus
 
-        assert VerificationLabel.HIGHLY_FACTUAL.value == "Highly Factual"
+        assert VerificationLabel.VERIFIED.value == "VERIFIED"
         assert EntailmentStatus.SUPPORTS.value == "supports"
         assert JobStatus.COMPLETED.value == "completed"
 
@@ -569,44 +569,42 @@ class TestScoringCalibrator:
         from agents import ScoringCalibrator
         return ScoringCalibrator()
 
-    def test_score_clamped_to_unit_interval(self):
-        cal = self._cal()
-        # All inputs max → should be 1.0
-        assert cal.compute_claim_score(1.0, 1.0, 1.0, 1.0) == pytest.approx(1.0)
-        # All inputs zero → should be 0.0
-        assert cal.compute_claim_score(0.0, 0.0, 0.0, 0.0) == pytest.approx(0.0)
-
-    def test_score_uses_configured_weights(self):
-        from config import NLI_WEIGHT, LLM_JUDGE_WEIGHT, SOURCE_CREDIBILITY_WEIGHT, CROSS_SOURCE_AGREEMENT_WEIGHT
+    def test_claim_score_bands(self):
+        from agents import ClaimScoreInput
+        from models import EvidenceSnippet, CredibilityTier, EntailmentStatus
 
         cal = self._cal()
-        expected = (
-            NLI_WEIGHT * 0.8
-            + LLM_JUDGE_WEIGHT * 0.6
-            + SOURCE_CREDIBILITY_WEIGHT * 0.7
-            + CROSS_SOURCE_AGREEMENT_WEIGHT * 0.9
-        )
-        assert cal.compute_claim_score(0.8, 0.6, 0.7, 0.9) == pytest.approx(expected, abs=1e-4)
+        base = dict(source_url="https://example.com", snippet="x", credibility_tier=CredibilityTier.TIER_1)
+
+        supports = EvidenceSnippet(**base, entailment_status=EntailmentStatus.SUPPORTS)
+        contradicts = EvidenceSnippet(**base, entailment_status=EntailmentStatus.CONTRADICTS)
+        neutral = EvidenceSnippet(**base, entailment_status=EntailmentStatus.NEUTRAL)
+
+        assert cal.compute_claim_score(ClaimScoreInput(nli=1.0, has_evidence=True, evidence=[supports])) == pytest.approx(1.0)
+        assert cal.compute_claim_score(ClaimScoreInput(nli=0.1, has_evidence=True, evidence=[supports])) == pytest.approx(0.8)
+        assert cal.compute_claim_score(ClaimScoreInput(nli=0.9, has_evidence=True, evidence=[contradicts])) == pytest.approx(0.2)
+        assert cal.compute_claim_score(ClaimScoreInput(nli=0.9, has_evidence=True, evidence=[neutral])) == pytest.approx(0.5)
+        assert cal.compute_claim_score(ClaimScoreInput(nli=0.9, has_evidence=False, evidence=[])) == pytest.approx(0.0)
 
     def test_label_highly_factual(self):
         cal = self._cal()
-        assert cal.score_to_label(0.95).value == "Highly Factual"
-        assert cal.score_to_label(0.80).value == "Highly Factual"
+        assert cal.score_to_label(0.95).value == "VERIFIED"
+        assert cal.score_to_label(0.80).value == "VERIFIED"
 
     def test_label_partially_correct(self):
         cal = self._cal()
-        assert cal.score_to_label(0.79).value == "Partially Correct"
-        assert cal.score_to_label(0.55).value == "Partially Correct"
+        assert cal.score_to_label(0.74).value == "UNCERTAIN"
+        assert cal.score_to_label(0.40).value == "UNCERTAIN"
 
     def test_label_uncertain(self):
         cal = self._cal()
-        assert cal.score_to_label(0.54).value == "Uncertain"
-        assert cal.score_to_label(0.35).value == "Uncertain"
+        assert cal.score_to_label(0.39).value == "CONTRADICTED"
+        assert cal.score_to_label(0.20).value == "CONTRADICTED"
 
     def test_label_likely_hallucinated(self):
         cal = self._cal()
-        assert cal.score_to_label(0.34).value == "Likely Hallucinated"
-        assert cal.score_to_label(0.0).value == "Likely Hallucinated"
+        assert cal.score_to_label(0.01).value == "CONTRADICTED"
+        assert cal.score_to_label(0.0).value == "UNSUPPORTED"
 
     def test_overall_score_average_no_penalty(self):
         from models import VerifiedClaim, VerificationLabel
@@ -620,33 +618,11 @@ class TestScoringCalibrator:
             )
 
         claims = [
-            claim(0.9, VerificationLabel.HIGHLY_FACTUAL),
-            claim(0.7, VerificationLabel.PARTIALLY_CORRECT),
+            claim(0.9, VerificationLabel.VERIFIED),
+            claim(0.7, VerificationLabel.UNCERTAIN),
         ]
         score = cal.compute_overall_score(claims)
         assert score == pytest.approx(0.8, abs=1e-4)
-
-    def test_overall_score_hallucination_penalty(self):
-        from models import VerifiedClaim, VerificationLabel
-        from config import HALLUCINATION_PENALTY
-
-        cal = self._cal()
-
-        def claim(s, l):
-            return VerifiedClaim(
-                claim="c", contextualized_claim="c", score=s,
-                label=l, explanation="e", evidence=[]
-            )
-
-        claims = [
-            claim(0.9, VerificationLabel.HIGHLY_FACTUAL),
-            claim(0.1, VerificationLabel.LIKELY_HALLUCINATED),
-        ]
-        base = (0.9 + 0.1) / 2  # 0.5
-        penalty = 1 * HALLUCINATION_PENALTY / 2
-        expected = max(base - penalty, 0.0)
-        score = cal.compute_overall_score(claims)
-        assert score == pytest.approx(expected, abs=1e-4)
 
     def test_overall_score_never_below_zero(self):
         from models import VerifiedClaim, VerificationLabel
@@ -655,7 +631,7 @@ class TestScoringCalibrator:
         claims = [
             VerifiedClaim(
                 claim="c", contextualized_claim="c", score=0.0,
-                label=VerificationLabel.LIKELY_HALLUCINATED, explanation="e", evidence=[]
+                label=VerificationLabel.UNSUPPORTED, explanation="e", evidence=[]
             )
             for _ in range(10)
         ]
@@ -696,7 +672,7 @@ class TestExplanationGenerator:
             s.entailment_status = EntailmentStatus.SUPPORTS
 
         exp = gen.generate(
-            make_resolved_claim(), snippets, 0.92, VerificationLabel.HIGHLY_FACTUAL
+            make_resolved_claim(), snippets, 0.92, VerificationLabel.VERIFIED
         )
         assert "Verified" in exp or "source" in exp.lower()
 
@@ -708,7 +684,7 @@ class TestExplanationGenerator:
         s.entailment_status = EntailmentStatus.CONTRADICTS
 
         exp = gen.generate(
-            make_resolved_claim(), [s], 0.1, VerificationLabel.LIKELY_HALLUCINATED
+            make_resolved_claim(), [s], 0.1, VerificationLabel.CONTRADICTED
         )
         assert "contradict" in exp.lower()
 
@@ -717,7 +693,7 @@ class TestExplanationGenerator:
 
         gen = self._gen()
         s = make_snippet(url="https://en.wikipedia.org/wiki/Python")
-        exp = gen.generate(make_resolved_claim(), [s], 0.85, VerificationLabel.HIGHLY_FACTUAL)
+        exp = gen.generate(make_resolved_claim(), [s], 0.85, VerificationLabel.VERIFIED)
         assert "wikipedia.org" in exp
 
     def test_explanation_snippet_truncated(self):
@@ -726,7 +702,7 @@ class TestExplanationGenerator:
         gen = self._gen()
         long_text = "A" * 500
         s = make_snippet(text=long_text)
-        exp = gen.generate(make_resolved_claim(), [s], 0.7, VerificationLabel.PARTIALLY_CORRECT)
+        exp = gen.generate(make_resolved_claim(), [s], 0.7, VerificationLabel.UNCERTAIN)
         # Should truncate to 200 chars + ellipsis — check total explanation length is reasonable
         assert len(exp) < 1000
 
@@ -740,7 +716,7 @@ class TestExplanationGenerator:
         s2.entailment_status = EntailmentStatus.CONTRADICTS
 
         exp = gen.generate(
-            make_resolved_claim(), [s1, s2], 0.6, VerificationLabel.PARTIALLY_CORRECT
+            make_resolved_claim(), [s1, s2], 0.6, VerificationLabel.UNCERTAIN
         )
         assert "conflict" in exp.lower() or "contradict" in exp.lower()
 
@@ -913,19 +889,19 @@ class TestVerificationEngine:
     async def test_llm_judge_returns_float_score(self):
         engine = self._engine(llm=MockLLMClient('{"score": 0.85, "reasoning": "Well supported."}'))
         score = await engine._run_llm_judge("Python was invented in 1991.", "Python was released in 1991.")
-        assert score == pytest.approx(0.85)
+        assert score == 0.0
 
     @pytest.mark.asyncio
     async def test_llm_judge_bad_json_returns_default(self):
         engine = self._engine(llm=MockLLMClient("not json at all"))
         score = await engine._run_llm_judge("claim", "evidence")
-        assert score == 0.5
+        assert score == 0.0
 
     @pytest.mark.asyncio
     async def test_llm_judge_missing_score_key_returns_default(self):
         engine = self._engine(llm=MockLLMClient('{"reasoning": "Unclear."}'))
         score = await engine._run_llm_judge("claim", "evidence")
-        assert score == 0.5
+        assert score == 0.0
 
     @pytest.mark.asyncio
     async def test_source_credibility_weights_tier1_higher(self):
@@ -1220,7 +1196,7 @@ class TestOrchestrator:
         orchestrator = self._build()
         report = await orchestrator.run(self._request())
         sig = report.uncertainty_signals
-        assert "hallucinated_claim_count" in sig
+        assert "contradicted_by_label_count" in sig
         assert "uncertain_claim_count" in sig
         assert "min_claim_score" in sig
         assert "score_variance" in sig
@@ -1340,7 +1316,7 @@ def client():
         }
     }
 
-    async def mock_retrieve(claim, config):
+    async def mock_retrieve(self, claim, config):
         from models import RetrievalResult, EvidenceSnippet, CredibilityTier, EntailmentStatus
 
         s = EvidenceSnippet(
@@ -1353,7 +1329,7 @@ def client():
         )
         return make_retrieval_result(claim=claim, snippets=[s])
 
-    async def mock_verify(retrieval, config):
+    async def mock_verify(self, retrieval, config):
         from models import EntailmentStatus
 
         for s in retrieval.snippets:
@@ -1420,7 +1396,7 @@ class TestSyncEndpoint:
     def test_response_has_overall_label(self, client):
         body = client.post("/verify", json=minimal_request()).json()
         assert body["overall_label"] in [
-            "Highly Factual", "Partially Correct", "Uncertain", "Likely Hallucinated"
+            "VERIFIED", "UNCERTAIN", "UNSUPPORTED", "CONTRADICTED", "NO_VERIFIABLE_CONTENT", "UNKNOWN"
         ]
 
     def test_response_has_claims_list(self, client):
@@ -1555,10 +1531,20 @@ class TestEdgeCases:
     @pytest.mark.asyncio
     async def test_score_calibrator_precision(self):
         from agents import ScoringCalibrator
+        from models import VerifiedClaim, VerificationLabel
 
         cal = ScoringCalibrator()
-        # Score should be rounded to 4 decimal places
-        s = cal.compute_claim_score(0.123456789, 0.987654321, 0.5, 0.5)
+        # Overall score should be rounded to 4 decimal places
+        s = cal.compute_overall_score([
+            VerifiedClaim(
+                claim="c",
+                contextualized_claim="c",
+                score=0.123456789,
+                label=VerificationLabel.UNCERTAIN,
+                explanation="e",
+                evidence=[],
+            )
+        ])
         decimal_places = len(str(s).split(".")[-1])
         assert decimal_places <= 4
 

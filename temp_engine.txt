@@ -1,0 +1,101 @@
+class VerificationEngine:
+    """
+    Scores each (claim, evidence) pair using triple-aware NLI and a
+    relation-type-specific LLM judge. NumericComparator runs independently
+    and can hard-override the entailment status.
+    """
+
+    def __init__(self, llm_client: "LLMClient | None" = None) -> None:
+        self._llm = llm_client
+
+    async def verify(
+        self, retrieval: RetrievalResult, config
+    ) -> tuple[float, float, float, float, list[EvidenceSnippet]]:
+        """Returns (nli, llm_judge, source_weight, cross_agreement, snippets)."""
+        claim_text = retrieval.claim.contextualized_text
+        snippets   = retrieval.snippets
+        analysis   = retrieval.claim.analysis
+
+        if not snippets:
+            return 0.0, 0.0, 0.0, 0.0, snippets
+
+        triple     = analysis.triple if analysis else RelationalTriple()
+        ctype      = analysis.claim_type if analysis else ClaimType.GENERAL
+        numerics   = analysis.numeric_assertions if analysis else []
+
+        # NLI hypothesis = the actual fact being claimed ("subject predicate object qualifier")
+        nli_hyp = _build_hypothesis(triple, claim_text)
+
+        scoring_enabled = bool(config.enable_nli) or bool(config.enable_llm_judge and self._llm)
+
+        if scoring_enabled:
+            tasks = [
+                self._score_snippet(claim_text, nli_hyp, s, config, ctype, triple, numerics)
+                for s in snippets
+            ]
+            annotated: list[EvidenceSnippet] = await asyncio.gather(*tasks)
+        else:
+            # Preserve any pre-annotated statuses/scores (tests rely on this).
+            annotated = snippets
+
+        # NLI aggregate — subject-matched snippets carry full weight; others 60%
+        subject_ok = [s for s in annotated if s.subject_match_score >= SUBJECT_MATCH_THRESHOLD]
+        if subject_ok:
+            nli_agg = _mean([s.nli_score for s in subject_ok])
+            llm_agg = _mean([s.llm_judge_score for s in subject_ok])
+        else:
+            nli_agg = _mean([s.nli_score for s in annotated]) * 0.60
+            llm_agg = _mean([s.llm_judge_score for s in annotated]) * 0.60
+
+        # Source credibility weighted by subject AND relation match
+        cred = [
+            s.nli_score
+            * CREDIBILITY_MULTIPLIERS[s.credibility_tier.value]
+            * max(s.subject_match_score, SUBJECT_MATCH_THRESHOLD)
+            * (0.70 + 0.30 * s.relation_match_score)
+            for s in annotated
+        ]
+        source_weight = _mean(cred)
+
+        # Cross-source agreement
+        sup = sum(1 for s in annotated if s.entailment_status == EntailmentStatus.SUPPORTS)
+        con = sum(1 for s in annotated if s.entailment_status == EntailmentStatus.CONTRADICTS)
+        n   = len(annotated)
+        cross_agreement = 0.0 if n == 0 else ((sup - con) / n + 1.0) / 2.0
+
+        return nli_agg, llm_agg, source_weight, cross_agreement, annotated
+
+    async def _score_snippet(
+        self,
+        claim_text: str,
+        nli_hyp: str,
+        snippet: EvidenceSnippet,
+        config,
+        ctype: ClaimType,
+        triple: RelationalTriple,
+        numerics: list[NumericAssertion],
+    ) -> EvidenceSnippet:
+        nli_task = (
+            asyncio.to_thread(self._run_nli, nli_hyp, snippet.snippet)
+            if config.enable_nli
+            else _async_const((0.0, EntailmentStatus.NEUTRAL))
+        )
+        llm_task = (
+            self._run_llm_judge(claim_text, snippet.snippet, ctype, triple)
+            if config.enable_llm_judge and self._llm
+            else _async_const(0.5)
+        )
+        num_task = asyncio.to_thread(NumericComparator.compare, snippet.snippet, numerics)
+
+        (nli_score, nli_status), llm_score, numeric_result = await asyncio.gather(
+            nli_task, llm_task, num_task
+        )
+
+        if llm_score >= 0.67:
+            llm_status = EntailmentStatus.SUPPORTS
+        elif llm_score <= 0.33:
+            llm_status = EntailmentStatus.CONTRADICTS
+        else:
+            llm_status = EntailmentStatus.NEUTRAL
+
+        snippet.nli_score          = nli_score

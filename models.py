@@ -49,10 +49,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 class VerificationLabel(str, Enum):
-    HIGHLY_FACTUAL = "Highly Factual"
-    PARTIALLY_CORRECT = "Partially Correct"
-    UNCERTAIN = "Uncertain"
-    LIKELY_HALLUCINATED = "Likely Hallucinated"
+    VERIFIED = "VERIFIED"
+    UNCERTAIN = "UNCERTAIN"
+    UNSUPPORTED = "UNSUPPORTED"
+    CONTRADICTED = "CONTRADICTED"
+    UNKNOWN = "UNKNOWN"
     NO_VERIFIABLE_CONTENT = "NO_VERIFIABLE_CONTENT"
 
 
@@ -377,7 +378,7 @@ class VerificationReport(BaseModel):
 
     @model_validator(mode="after")
     def populate_uncertainty_signals(self) -> VerificationReport:
-        hallucinated = [c for c in self.claims if c.label == VerificationLabel.LIKELY_HALLUCINATED]
+        contradicted = [c for c in self.claims if c.label == VerificationLabel.CONTRADICTED]
         uncertain = [c for c in self.claims if c.label == VerificationLabel.UNCERTAIN]
         no_evidence = [c for c in self.claims if not c.has_evidence]
         relation_unverified = [c for c in self.claims if not c.relation_verified and c.has_evidence]
@@ -391,14 +392,14 @@ class VerificationReport(BaseModel):
             type_breakdown[c.claim_type.value] = type_breakdown.get(c.claim_type.value, 0) + 1
 
         self.uncertainty_signals = {
-            "hallucinated_claim_count": len(hallucinated),
+            "contradicted_by_label_count": len(contradicted),
             "uncertain_claim_count": len(uncertain),
             "no_evidence_claim_count": len(no_evidence),
             "relation_unverified_count": len(relation_unverified),
             "numeric_contradiction_count": len(numeric_contradictions),
             "min_claim_score": min((c.score for c in self.claims), default=1.0),
             "score_variance": _variance([c.score for c in self.claims]),
-            "contradicted_claim_count": sum(
+            "contradicted_by_evidence_count": sum(
                 1 for c in self.claims
                 if any(e.entailment_status == EntailmentStatus.CONTRADICTS for e in c.evidence)
             ),

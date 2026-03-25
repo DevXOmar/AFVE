@@ -59,6 +59,7 @@ import math
 import re
 import time
 from collections import Counter
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
 import httpx
@@ -174,24 +175,23 @@ _PREDICATE_SYNONYMS: dict[ClaimType, frozenset[str]] = {
 # Lazy model loaders
 # ---------------------------------------------------------------------------
 
-_nli_pipeline = None
+# Eagerly load NLI globally (Never per request/claim/loop)
+NLI_PIPELINE = None
 _reranker = None
 
+try:
+    from transformers import pipeline  # type: ignore
+    NLI_PIPELINE = pipeline(
+        "text-classification",
+        model=settings.nli_model_name,
+        device=-1,  # CPU
+    )
+    logger.info("NLI loaded globally: %s", settings.nli_model_name)
+except Exception as exc:
+    logger.warning("NLI unavailable globally (%s).", exc)
 
 def _get_nli_pipeline():
-    global _nli_pipeline
-    if _nli_pipeline is None:
-        try:
-            from transformers import pipeline  # type: ignore
-            _nli_pipeline = pipeline(
-                "text-classification",
-                model=settings.nli_model_name,
-                device=-1,  # CPU
-            )
-            logger.info("NLI loaded: %s", settings.nli_model_name)
-        except Exception as exc:
-            logger.warning("NLI unavailable (%s); using heuristic.", exc)
-    return _nli_pipeline
+    return NLI_PIPELINE
 
 
 def _get_reranker():
@@ -199,11 +199,61 @@ def _get_reranker():
     if _reranker is None:
         try:
             from sentence_transformers import CrossEncoder  # type: ignore
-            _reranker = CrossEncoder(settings.reranker_model_name)
-            logger.info("Reranker loaded.")
+            # Prefer MPS on macOS if it works; otherwise fall back to CPU.
+            # This avoids common device/meta-tensor issues.
+            last_exc: Exception | None = None
+            for device in ("mps", "cpu"):
+                try:
+                    _reranker = CrossEncoder(settings.reranker_model_name, device=device)
+                    logger.info("Reranker loaded (%s): %s", device, settings.reranker_model_name)
+                    last_exc = None
+                    break
+                except Exception as exc:  # pragma: no cover
+                    last_exc = exc
+                    _reranker = None
+            if last_exc is not None:
+                raise last_exc
         except Exception as exc:
             logger.warning("Reranker unavailable (%s).", exc)
     return _reranker
+
+
+# ---------------------------------------------------------------------------
+# Retrieval query hygiene
+# ---------------------------------------------------------------------------
+
+_RETRIEVAL_STOPWORDS: frozenset[str] = frozenset({
+    "it", "is", "the", "a", "an", "for", "in", "on", "that", "another", "here",
+    "this", "these", "those", "they", "them", "he", "she", "we", "you", "i",
+    "of", "to", "and", "or", "as", "at", "by", "from", "with", "without",
+})
+
+
+def is_valid_entity(text: str) -> bool:
+    text = (text or "").strip()
+    return (
+        len(text) > 2
+        and text.lower() not in _RETRIEVAL_STOPWORDS
+        and any(c.isalpha() for c in text)
+    )
+
+
+def _sanitize_query(query: str) -> str:
+    """Remove obvious garbage tokens before sending external requests."""
+    if not query:
+        return ""
+
+    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9\-']+", query)
+    kept: list[str] = []
+    for t in tokens:
+        if not is_valid_entity(t):
+            continue
+        if len(t) <= 2:
+            continue
+        kept.append(t)
+
+    sanitized = " ".join(kept).strip()
+    return sanitized if len(sanitized) > 2 else ""
 
 
 # ===========================================================================
@@ -582,52 +632,118 @@ class RelationalDecomposer:
 
 class ClaimExtractionAgent:
     """
-    Extracts verifiable sentences → coreference resolution →
-    RelationalDecomposer (triple + multi-claim split) →
-    flat list of ResolvedClaims.
+    Rule-based extraction of verifiable claims, followed by hybrid triple decomposition.
     """
 
-    _UNVERIFIABLE: list[re.Pattern] = [
-        re.compile(p, re.IGNORECASE)
-        for p in [
-            r"\bI (think|believe|feel|suppose|guess|would say)\b",
-            r"\b(in my opinion|personally|arguably|some might say)\b",
-            r"\b(hello|hi|hey|thanks|thank you|sure|of course|great question)\b",
-            r"\bhow\s+can\s+i\s+(help|assist)\b",
-            r"\bhow\s+may\s+i\s+(help|assist)\b",
-            r"^\s*(it\s+(might|may|could|is\s+possible)|there\s+might\s+be)\b",
-            r"\bit\s+is\s+(often|widely|commonly|generally)\s+(said|believed|thought|considered)\b",
-            r"(here\s+are|the\s+following|below\s+(is|are)|let\s+me\s+(list|outline|explain))",
-            r"^\s*$",
-        ]
-    ]
-    _MIN_WORDS = 5  # allow short factual claims like "Python was released in 1991."
-
-    def __init__(
-        self,
-        llm_client: "LLMClient | None" = None,
-        decomposer: "RelationalDecomposer | None" = None,
-    ) -> None:
+    def __init__(self, llm_client=None, decomposer=None) -> None:
         self._llm = llm_client
         self._decomposer = decomposer or RelationalDecomposer(llm_client=llm_client)
+
+    def is_verifiable(self, text: str) -> bool:
+        """Rule-based classifier to reject questions, opinions, and conversational text."""
+        text = text.strip()
+        if not text or len(text.split()) < 3: return False
+        if text.endswith('?'): return False
+        
+        lower_text = text.lower()
+        unverifiable_prefixes = [
+            "i think", "i believe", "in my opinion", "hello", "hi", "how can i",
+            "here are", "below is", "let me", "sure", "of course", "personally",
+            "arguably", "some might say", "yes", "it might", "it may", "it could"
+        ]
+        if any(lower_text.startswith(p) for p in unverifiable_prefixes):
+            return False
+            
+        return True
+
+    def _split_sentences(self, text: str) -> list[RawClaim]:
+        import re
+        pat = re.compile(r"(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|!)\s")
+        parts = pat.split(text.strip())
+        claims: list[RawClaim] = []
+        for idx, part in enumerate(parts):
+            part = part.strip()
+            if not part: continue
+            is_v = self.is_verifiable(part)
+            claims.append(RawClaim(text=part, sentence_index=idx, is_verifiable=is_v))
+        return claims
+
+    # ------------------------------------------------------------------
+    # Backward-compatible helpers (used by the test suite)
+    # ------------------------------------------------------------------
+
+    def _split_into_sentences(self, text: str) -> list[RawClaim]:
+        return self._split_sentences(text)
+
+    async def _resolve_coreferences(
+        self,
+        raw_claims: list[RawClaim],
+        prompt: str,
+        model_output: str,
+    ) -> list[ResolvedClaim]:
+        """Optional coreference resolver.
+
+        This is deliberately best-effort and only used when explicitly enabled.
+        On any failure, falls back to the raw claim text.
+        """
+        fallback = [
+            ResolvedClaim(
+                original_text=c.text,
+                contextualized_text=c.text,
+                sentence_index=c.sentence_index,
+                atom_index=0,
+                analysis=None,
+            )
+            for c in raw_claims
+        ]
+
+        if not raw_claims:
+            return []
+        if not getattr(settings, "enable_coreference_resolution", False):
+            return fallback
+        if not self._llm:
+            return fallback
+
+        system = (
+            "Resolve coreferences (pronouns like it/they/this) in each sentence using the given context. "
+            "Return ONLY a JSON array of strings, one per input sentence, in the same order."
+        )
+        user = (
+            f"CONTEXT PROMPT: {prompt}\n"
+            f"MODEL OUTPUT: {model_output}\n"
+            f"SENTENCES: {json.dumps([c.text for c in raw_claims])}\n"
+            "RESOLVED JSON ARRAY:"
+        )
+        try:
+            raw = (await self._llm.complete(system, user, max_tokens=256)).strip()
+            resolved = json.loads(raw)
+            if not isinstance(resolved, list) or len(resolved) != len(raw_claims):
+                return fallback
+            out: list[ResolvedClaim] = []
+            for c, r in zip(raw_claims, resolved):
+                out.append(
+                    ResolvedClaim(
+                        original_text=c.text,
+                        contextualized_text=str(r).strip() or c.text,
+                        sentence_index=c.sentence_index,
+                        atom_index=0,
+                        analysis=None,
+                    )
+                )
+            return out
+        except Exception:
+            return fallback
 
     async def extract(self, request: VerificationRequest) -> list[ResolvedClaim]:
         raw = self._split_sentences(request.model_output)
         verifiable = [c for c in raw if c.is_verifiable]
-        logger.info("Extracted %d verifiable / %d total sentences.",
-                    len(verifiable), len(raw))
+        logger.info("Extracted %d verifiable / %d total sentences.", len(verifiable), len(raw))
 
-        if settings.enable_coreference_resolution and self._llm:
-            resolved_texts = await self._resolve(
-                [c.text for c in verifiable], request.model_output
-            )
-        else:
-            resolved_texts = [c.text for c in verifiable]
-
+        texts = [c.text for c in verifiable]
+        
+        import asyncio
         atom_tasks = [
-            self._decomposer.decompose(
-                resolved_texts[i], verifiable[i].sentence_index, request.config
-            )
+            self._decomposer.decompose(texts[i], verifiable[i].sentence_index, request.config)
             for i in range(len(verifiable))
         ]
         atom_lists = await asyncio.gather(*atom_tasks, return_exceptions=True)
@@ -646,80 +762,8 @@ class ClaimExtractionAgent:
                     analysis=atom.analysis,
                 ))
 
-        logger.info("Generated %d atomic claims from %d sentences.",
-                    len(claims), len(verifiable))
+        logger.info("Generated %d atomic claims from %d sentences.", len(claims), len(verifiable))
         return claims
-
-    def _split_sentences(self, text: str) -> list[RawClaim]:
-        pat = re.compile(r"(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|!)\s")
-        parts = pat.split(text.strip())
-        claims: list[RawClaim] = []
-        for idx, part in enumerate(parts):
-            part = part.strip()
-            if not part:
-                continue
-            is_v = not any(p.search(part) for p in self._UNVERIFIABLE)
-            if len(part.split()) < self._MIN_WORDS:
-                is_v = False
-            claims.append(RawClaim(text=part, sentence_index=idx, is_verifiable=is_v))
-        return claims
-
-    # ------------------------------------------------------------------
-    # Backward-compatible helpers (used by the test suite)
-    # ------------------------------------------------------------------
-
-    def _split_into_sentences(self, text: str) -> list[RawClaim]:
-        return self._split_sentences(text)
-
-    async def _resolve_coreferences(
-        self,
-        raw_claims: list[RawClaim],
-        prompt: str,
-        full_output: str,
-    ) -> list[ResolvedClaim]:
-        del prompt  # prompt is optional context for the resolver
-
-        texts = [c.text for c in raw_claims]
-        if settings.enable_coreference_resolution and self._llm:
-            resolved_texts = await self._resolve(texts, full_output)
-        else:
-            resolved_texts = texts
-
-        if len(resolved_texts) != len(raw_claims):
-            resolved_texts = texts
-
-        return [
-            ResolvedClaim(
-                original_text=raw_claims[i].text,
-                contextualized_text=resolved_texts[i],
-                sentence_index=raw_claims[i].sentence_index,
-                atom_index=0,
-                analysis=None,
-            )
-            for i in range(len(raw_claims))
-        ]
-
-    async def _resolve(self, texts: list[str], full_output: str) -> list[str]:
-        system = (
-            "You are a coreference resolution specialist. "
-            "Rewrite each claim to be fully self-contained. "
-            "Return ONLY a JSON array of strings, same order."
-        )
-        user = (
-            f"CONTEXT:\n{full_output[:2000]}\n\n"
-            "CLAIMS:\n" + "\n".join(f"{i+1}. {t}" for i, t in enumerate(texts))
-        )
-        try:
-            raw = await self._llm.complete(system, user, max_tokens=1024)
-            raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-            resolved: list[str] = json.loads(raw)
-            if len(resolved) != len(texts):
-                raise ValueError("Length mismatch")
-            return resolved
-        except Exception as exc:
-            logger.warning("Coreference failed (%s).", exc)
-            return texts
-
 
 # ===========================================================================
 # B. Retrieval Agent — Subject-First
@@ -766,7 +810,20 @@ class RetrievalAgent:
 
         for attempt in range(config.max_retrieval_attempts):
             queries_attempted += 1
-            query = queries[min(attempt, len(queries) - 1)]
+            raw_query = queries[min(attempt, len(queries) - 1)]
+            query = _sanitize_query(raw_query)
+            if not query:
+                query = _sanitize_query(subject) if subject else ""
+            if not query:
+                query = _sanitize_query(claim.contextualized_text)
+            if not query:
+                logger.debug(
+                    "[%s] Attempt %d: query filtered out (raw=%r)",
+                    ctype.value,
+                    attempt + 1,
+                    raw_query,
+                )
+                continue
             logger.debug("[%s] Attempt %d: %s", ctype.value, attempt + 1, query)
 
             parallel = []
@@ -1044,18 +1101,62 @@ class RetrievalAgent:
 
 class VerificationEngine:
     """
-    Scores each (claim, evidence) pair using triple-aware NLI and a
-    relation-type-specific LLM judge. NumericComparator runs independently
-    and can hard-override the entailment status.
+    Scores each (claim, evidence) pair using ONLY the global NLI (cross-encoder).
+    NO LLM usage happens here.
     """
 
-    def __init__(self, llm_client: "LLMClient | None" = None) -> None:
-        self._llm = llm_client
+    def __init__(self, llm_client=None) -> None:
+        self._llm = None  # Explicitly remove LLM usage
+
+    def _run_nli(self, premise: str, hypothesis: str) -> tuple[float, EntailmentStatus]:
+        """Run NLI if available; otherwise fall back to a simple lexical heuristic.
+
+        This helper exists mainly for unit tests and graceful degradation.
+        """
+        pipeline = _get_nli_pipeline()
+        if pipeline:
+            try:
+                res = pipeline([{"text": premise, "text_pair": hypothesis}])[0]
+                raw_label = str(res.get("label", "")).strip()
+                score = float(res.get("score", 0.5))
+
+                label_norm = raw_label
+                m = re.match(r"^LABEL_(\d+)$", raw_label.strip(), flags=re.IGNORECASE)
+                if m:
+                    idx = int(m.group(1))
+                    id2label = getattr(getattr(pipeline, "model", None), "config", None)
+                    id2label = getattr(id2label, "id2label", {}) if id2label is not None else {}
+                    mapped = id2label.get(idx)
+                    if mapped:
+                        label_norm = str(mapped)
+
+                label = label_norm.upper()
+                decisive_threshold = 0.85
+                if label in {"AGREEMENT", "ENTAILMENT", "ENTAIL", "SUPPORTS"} and score >= decisive_threshold:
+                    return score, EntailmentStatus.SUPPORTS
+                if label in {"CONTRADICTION", "CONTRADICT", "CONTRADICTS"} and score >= decisive_threshold:
+                    return score, EntailmentStatus.CONTRADICTS
+                return score, EntailmentStatus.NEUTRAL
+            except Exception:
+                return 0.5, EntailmentStatus.NEUTRAL
+
+        # Heuristic fallback: token overlap ratio
+        tok = lambda s: set(re.findall(r"[a-z0-9]+", (s or "").lower()))
+        a = tok(premise)
+        b = tok(hypothesis)
+        if not a or not b:
+            return 0.0, EntailmentStatus.NEUTRAL
+        overlap = len(a & b) / max(len(b), 1)
+        status = EntailmentStatus.SUPPORTS if overlap >= 0.5 else EntailmentStatus.NEUTRAL
+        return float(overlap), status
+
+    async def _run_llm_judge(self, claim: str, evidence: str) -> float:
+        """Deterministic stub: LLM judge is disabled in this build."""
+        return 0.0
 
     async def verify(
         self, retrieval: RetrievalResult, config
     ) -> tuple[float, float, float, float, list[EvidenceSnippet]]:
-        """Returns (nli, llm_judge, source_weight, cross_agreement, snippets)."""
         claim_text = retrieval.claim.contextualized_text
         snippets   = retrieval.snippets
         analysis   = retrieval.claim.analysis
@@ -1063,218 +1164,96 @@ class VerificationEngine:
         if not snippets:
             return 0.0, 0.0, 0.0, 0.0, snippets
 
-        triple     = analysis.triple if analysis else RelationalTriple()
-        ctype      = analysis.claim_type if analysis else ClaimType.GENERAL
-        numerics   = analysis.numeric_assertions if analysis else []
+        annotated: list[EvidenceSnippet]
+        if getattr(config, "enable_nli", True):
+            triple = analysis.triple if analysis else RelationalTriple()
+            nli_hyp = _build_hypothesis(triple, claim_text)
 
-        # NLI hypothesis = the actual fact being claimed ("subject predicate object qualifier")
-        nli_hyp = _build_hypothesis(triple, claim_text)
-
-        scoring_enabled = bool(config.enable_nli) or bool(config.enable_llm_judge and self._llm)
-
-        if scoring_enabled:
+            import asyncio
             tasks = [
-                self._score_snippet(claim_text, nli_hyp, s, config, ctype, triple, numerics)
+                asyncio.to_thread(self._score_snippet_sync, nli_hyp, s)
                 for s in snippets
             ]
-            annotated: list[EvidenceSnippet] = await asyncio.gather(*tasks)
+            annotated = await asyncio.gather(*tasks)
         else:
-            # Preserve any pre-annotated statuses/scores (tests rely on this).
+            # Respect pre-annotated snippet statuses when NLI is disabled.
             annotated = snippets
 
-        # NLI aggregate — subject-matched snippets carry full weight; others 60%
-        subject_ok = [s for s in annotated if s.subject_match_score >= SUBJECT_MATCH_THRESHOLD]
-        if subject_ok:
-            nli_agg = _mean([s.nli_score for s in subject_ok])
-            llm_agg = _mean([s.llm_judge_score for s in subject_ok])
-        else:
-            nli_agg = _mean([s.nli_score for s in annotated]) * 0.60
-            llm_agg = _mean([s.llm_judge_score for s in annotated]) * 0.60
-
-        # Source credibility weighted by subject AND relation match
-        cred = [
-            s.nli_score
-            * CREDIBILITY_MULTIPLIERS[s.credibility_tier.value]
-            * max(s.subject_match_score, SUBJECT_MATCH_THRESHOLD)
-            * (0.70 + 0.30 * s.relation_match_score)
+        nli_agg = _mean([s.nli_score for s in annotated])
+        llm_agg = 0.0 # Disabled
+        
+        # Source credibility based only on NLI score
+        source_weight = _mean([
+            s.nli_score * CREDIBILITY_MULTIPLIERS.get(s.credibility_tier.value, 1.0)
             for s in annotated
-        ]
-        source_weight = _mean(cred)
+        ])
 
-        # Cross-source agreement
         sup = sum(1 for s in annotated if s.entailment_status == EntailmentStatus.SUPPORTS)
         con = sum(1 for s in annotated if s.entailment_status == EntailmentStatus.CONTRADICTS)
-        n   = len(annotated)
+        n = len(annotated)
         cross_agreement = 0.0 if n == 0 else ((sup - con) / n + 1.0) / 2.0
 
         return nli_agg, llm_agg, source_weight, cross_agreement, annotated
 
-    async def _score_snippet(
-        self,
-        claim_text: str,
-        nli_hyp: str,
-        snippet: EvidenceSnippet,
-        config,
-        ctype: ClaimType,
-        triple: RelationalTriple,
-        numerics: list[NumericAssertion],
-    ) -> EvidenceSnippet:
-        nli_task = (
-            asyncio.to_thread(self._run_nli, nli_hyp, snippet.snippet)
-            if config.enable_nli
-            else _async_const((0.0, EntailmentStatus.NEUTRAL))
-        )
-        llm_task = (
-            self._run_llm_judge(claim_text, snippet.snippet, ctype, triple)
-            if config.enable_llm_judge and self._llm
-            else _async_const(0.5)
-        )
-        num_task = asyncio.to_thread(NumericComparator.compare, snippet.snippet, numerics)
+    def _score_snippet_sync(self, nli_hyp: str, snippet: EvidenceSnippet) -> EvidenceSnippet:
+        # Load NLI correctly from the global single instance
+        pipeline = _get_nli_pipeline()
+        
+        if pipeline:
+            try:
+                # For MNLI-style models the (premise, hypothesis) order matters.
+                # Premise should be the evidence snippet; hypothesis is the claim.
+                res = pipeline([{"text": snippet.snippet, "text_pair": nli_hyp}])[0]
+                raw_label = str(res.get("label", "")).strip()
+                score = float(res.get("score", 0.5))
 
-        (nli_score, nli_status), llm_score, numeric_result = await asyncio.gather(
-            nli_task, llm_task, num_task
-        )
+                # Normalize label using id2label when pipelines return LABEL_0/LABEL_1/...
+                label_norm = raw_label
+                m = re.match(r"^LABEL_(\d+)$", raw_label.strip(), flags=re.IGNORECASE)
+                if m:
+                    idx = int(m.group(1))
+                    id2label = getattr(getattr(pipeline, "model", None), "config", None)
+                    id2label = getattr(id2label, "id2label", {}) if id2label is not None else {}
+                    mapped = id2label.get(idx)
+                    if mapped:
+                        label_norm = str(mapped)
 
-        if llm_score >= 0.67:
-            llm_status = EntailmentStatus.SUPPORTS
-        elif llm_score <= 0.33:
-            llm_status = EntailmentStatus.CONTRADICTS
+                label = label_norm.upper()
+
+                # NLI -> EntailmentStatus mapping
+                # Guardrail: ignore NLI "contradicts/supports" when the snippet is likely irrelevant.
+                # This prevents random Wikipedia pages from generating high-confidence contradictions.
+                subject_match = getattr(snippet, "subject_match_score", 1.0)
+                try:
+                    subject_match = float(subject_match)
+                except Exception:
+                    subject_match = 1.0
+
+                min_subject_match_for_decision = 0.5
+                decisive_threshold = 0.85
+
+                if subject_match < min_subject_match_for_decision:
+                    status = EntailmentStatus.NEUTRAL
+                elif label in {"AGREEMENT", "ENTAILMENT", "ENTAIL", "SUPPORTS"} and score >= decisive_threshold:
+                    status = EntailmentStatus.SUPPORTS
+                elif label in {"CONTRADICTION", "CONTRADICT", "CONTRADICTS"} and score >= decisive_threshold:
+                    status = EntailmentStatus.CONTRADICTS
+                else:
+                    status = EntailmentStatus.NEUTRAL
+            except Exception as e:
+                logger.warning(f"NLI failure: {e}")
+                status = EntailmentStatus.NEUTRAL
+                score = 0.5
         else:
-            llm_status = EntailmentStatus.NEUTRAL
+            status = EntailmentStatus.NEUTRAL
+            score = 0.5
 
-        snippet.nli_score          = nli_score
-        snippet.llm_judge_score    = llm_score
-        snippet.llm_entailment_status = llm_status
-        snippet.numeric_result     = numeric_result
+        snippet.entailment_status = status
+        snippet.nli_score = score
+        snippet.llm_judge_score = 0.0
 
-        # Numeric contradiction is a hard override
-        if numeric_result == ComparisonResult.CONTRADICTS:
-            merged = EntailmentStatus.CONTRADICTS
-        elif numeric_result == ComparisonResult.MATCHES:
-            merged = _merge_entailment(nli_status, llm_status, bias_supports=True)
-        else:
-            merged = _merge_entailment(nli_status, llm_status)
-
-        snippet.entailment_status = merged
         return snippet
 
-    # ------------------------------------------------------------------
-    # NLI
-    # ------------------------------------------------------------------
-
-    def _run_nli(
-        self, hypothesis: str, evidence: str
-    ) -> tuple[float, EntailmentStatus]:
-        nli = _get_nli_pipeline()
-        if nli is None:
-            return _heuristic_nli(hypothesis, evidence)
-        try:
-            results = nli(
-                {"text": evidence[:512], "text_pair": hypothesis},
-                top_k=None
-            )
-            # TextClassification pipeline with top_k=None returns list of dicts.
-            sc = {r["label"].lower(): r["score"] for r in results}
-            ent = sc.get("entailment", 0.0)
-            con = sc.get("contradiction", 0.0)
-            neu = sc.get("neutral", 0.5)
-
-            if ent > 0.50:
-                return round(ent, 4), EntailmentStatus.SUPPORTS
-            if con > 0.45:
-                return round(1.0 - con, 4), EntailmentStatus.CONTRADICTS
-            partial = (ent + (1.0 - neu)) / 2.0
-            return round(max(partial, 0.05), 4), EntailmentStatus.NEUTRAL
-        except Exception as exc:
-            logger.warning("NLI error: %s", exc)
-            return _heuristic_nli(hypothesis, evidence)
-
-    # ------------------------------------------------------------------
-    # LLM judge — triple-aware, relation-type-specific
-    # ------------------------------------------------------------------
-
-    async def _run_llm_judge(
-        self,
-        claim_text: str,
-        evidence: str,
-        ctype: ClaimType = ClaimType.GENERAL,
-        triple: RelationalTriple | None = None,
-    ) -> float:
-        """Return a float score in [0,1]. Defaults to 0.5 on parse errors."""
-        _triple = triple or RelationalTriple()
-        role_token = (
-            _triple.predicate.split()[-1]
-            if _triple.predicate and _triple.predicate.split()
-            else _triple.predicate
-        )
-        type_instructions: dict[ClaimType, str] = {
-            ClaimType.DATE: (
-                f"Check whether the evidence confirms that '{_triple.subject}' "
-                f"{_triple.predicate} in/at '{_triple.qualifier or _triple.object}'. "
-                "Any different year is a CONTRADICTION. "
-                "Off-by-one decade is also CONTRADICTION for exact dates."
-            ),
-            ClaimType.ROLE: (
-                f"Verify that '{_triple.subject}' holds the role "
-                f"'{role_token}' at/in '{_triple.object}'. "
-                "Wrong person OR wrong organisation OR wrong role = CONTRADICTION."
-            ),
-            ClaimType.AUTHORSHIP: (
-                f"Verify that '{_triple.subject}' {_triple.predicate} '{_triple.object}'. "
-                "A different creator is a CONTRADICTION."
-            ),
-            ClaimType.ATTRIBUTE: (
-                f"Check the numeric attribute of '{_triple.subject}': "
-                f"'{_triple.object or _triple.qualifier}'. "
-                "An order-of-magnitude difference is a CONTRADICTION."
-            ),
-            ClaimType.LOCATION: (
-                f"Verify that '{_triple.subject}' is located in '{_triple.object}'. "
-                "Wrong country or city = CONTRADICTION."
-            ),
-            ClaimType.COMPARATIVE: (
-                f"Check: is '{_triple.subject}' {_triple.predicate} '{_triple.object}'? "
-                "An inverted comparison = CONTRADICTION."
-            ),
-            ClaimType.MEMBERSHIP: (
-                f"Check that '{_triple.subject}' {_triple.predicate} '{_triple.object}'. "
-                "Verify the affiliation relationship exists."
-            ),
-            ClaimType.CAUSAL: (
-                f"Check: did '{_triple.subject}' {_triple.predicate} '{_triple.object}'? "
-                "Wrong direction (B→A when claim says A→B) = CONTRADICTION."
-            ),
-        }
-        hint = type_instructions.get(
-            ctype,
-            f"Verify: '{_triple.subject}' {_triple.predicate} '{_triple.object}'."
-        )
-
-        system = (
-            f"You are a relational fact-checking judge.\n"
-            f"CLAIM TYPE: {ctype.value.upper()}\n"
-            f"TRIPLE: subject='{_triple.subject}' | predicate='{_triple.predicate}' "
-            f"| object='{_triple.object}' | qualifier='{_triple.qualifier}'\n\n"
-            f"{hint}\n\n"
-            "Output ONLY valid JSON (no markdown, no explanation):\n"
-            '{"score":0.0-1.0,'
-            '"reasoning":"one sentence citing specific text"}\n\n'
-            "Rules:\n"
-            "- Return a score in [0,1]."
-        )
-        user = f"CLAIM: {claim_text}\n\nEVIDENCE:\n{evidence[:1800]}"
-
-        try:
-            raw = await self._llm.complete(system, user, max_tokens=350)
-            raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-            d = json.loads(raw)
-            score = float(d.get("score", 0.5))
-            if 0.0 <= score <= 1.0:
-                return round(score, 4)
-            return 0.5
-        except Exception as exc:
-            logger.warning("LLM judge error: %s", exc)
-            return 0.5
 
 
 # ===========================================================================
@@ -1387,113 +1366,55 @@ class NumericComparator:
 # ===========================================================================
 
 
+@dataclass(frozen=True)
+class ClaimScoreInput:
+    nli: float
+    has_evidence: bool
+    evidence: list[EvidenceSnippet]
+
+
 class ScoringCalibrator:
-    """
-    Six-signal composite score with truth prior, TRUE_POSITIVE_FLOOR,
-    and NUMERIC_CONTRADICTION_PENALTY.
+    """Single source of truth for scoring + labeling.
+
+    Stable public API (do not rename):
+    - compute_claim_score(self, claim) -> float
+    - compute_overall_score(self, claims) -> float
+    - score_to_label(self, score) -> VerificationLabel
     """
 
-    @staticmethod
-    def compute_claim_score(
-        nli: float,
-        llm_judge: float,
-        source_weight: float,
-        cross_agreement: float,
-        relation_score: float = 0.0,
-        numeric_result: ComparisonResult = ComparisonResult.NOT_FOUND,
-        has_evidence: bool = True,
-        analysis: RelationalAnalysis | None = None,
-        snippets: list[EvidenceSnippet] | None = None,
-    ) -> float:
-        if not has_evidence:
+    def compute_claim_score(self, claim: ClaimScoreInput) -> float:
+        """Return a normalized score in [0, 1]."""
+        if not claim.has_evidence or not claim.evidence:
             return 0.0
 
-        # Map numeric result to score
-        _num_map = {
-            ComparisonResult.MATCHES:     1.0,
-            ComparisonResult.CLOSE:       0.80,
-            ComparisonResult.DIVERGES:    0.45,
-            ComparisonResult.CONTRADICTS: 0.0,
-            ComparisonResult.NOT_FOUND:   None,
-        }
-        num_score = _num_map[numeric_result]
-        has_numeric = (
-            num_score is not None
-            and analysis is not None
-            and bool(analysis.numeric_assertions)
-        )
+        statuses = [s.entailment_status for s in claim.evidence]
 
-        if has_numeric:
-            raw = (
-                NLI_WEIGHT * nli
-                + LLM_JUDGE_WEIGHT * llm_judge
-                + SOURCE_CREDIBILITY_WEIGHT * source_weight
-                + CROSS_SOURCE_AGREEMENT_WEIGHT * cross_agreement
-                + RELATION_VERIFICATION_WEIGHT * relation_score
-                + NUMERIC_SCORE_WEIGHT * num_score  # type: ignore[operator]
-            )
-        else:
-            half = NUMERIC_SCORE_WEIGHT / 2.0
-            raw = (
-                (NLI_WEIGHT + half) * nli
-                + (LLM_JUDGE_WEIGHT + half) * llm_judge
-                + SOURCE_CREDIBILITY_WEIGHT * source_weight
-                + CROSS_SOURCE_AGREEMENT_WEIGHT * cross_agreement
-                + RELATION_VERIFICATION_WEIGHT * relation_score
-            )
+        # Encode categories into stable score bands.
+        if any(s == EntailmentStatus.CONTRADICTS for s in statuses):
+            return 0.20
+        if any(s == EntailmentStatus.SUPPORTS for s in statuses):
+            return float(max(min(claim.nli, 1.0), 0.80))
 
-        # Truth prior nudge (8% pull toward prior)
-        if analysis:
-            raw = raw * 0.92 + analysis.truth_prior * 0.08
+        # Neutral / inconclusive evidence.
+        return 0.50
 
-        raw = min(max(raw, 0.0), 1.0)
-
-        # TRUE_POSITIVE_FLOOR — correct facts with strong dual-signal support
-        if snippets:
-            tier1_sup = any(
-                s.credibility_tier == CredibilityTier.TIER_1
-                and s.entailment_status == EntailmentStatus.SUPPORTS
-                and s.subject_match_score >= SUBJECT_MATCH_THRESHOLD
-                for s in snippets
-            )
-            any_con = any(
-                s.entailment_status == EntailmentStatus.CONTRADICTS for s in snippets
-            )
-            if nli > 0.57 and llm_judge > 0.57 and tier1_sup and not any_con:
-                if raw < TRUE_POSITIVE_FLOOR:
-                    logger.debug("TRUE_POSITIVE_FLOOR applied.")
-                    raw = TRUE_POSITIVE_FLOOR
-
-        # NUMERIC_CONTRADICTION hard ceiling
-        if numeric_result == ComparisonResult.CONTRADICTS:
-            ceiling = 1.0 - NUMERIC_CONTRADICTION_PENALTY
-            if raw > ceiling:
-                raw = ceiling
-                logger.debug("NUMERIC_CONTRADICTION_PENALTY applied.")
-
-        return round(raw, 4)
-
-    @staticmethod
-    def score_to_label(score: float) -> VerificationLabel:
-        for name, threshold in LABEL_THRESHOLDS.items():
-            if score >= threshold:
-                return VerificationLabel(name)
-        return VerificationLabel.LIKELY_HALLUCINATED
-
-    @staticmethod
-    def compute_overall_score(claims: list[VerifiedClaim]) -> float:
+    def compute_overall_score(self, claims: list[VerifiedClaim]) -> float:
         if not claims:
             return 0.0
-        base  = _mean([c.score for c in claims])
-        hall  = sum(1 for c in claims if c.label == VerificationLabel.LIKELY_HALLUCINATED)
-        noev  = sum(1 for c in claims if not c.has_evidence)
-        n     = max(len(claims), 1)
-        return round(max(
-            base
-            - hall * HALLUCINATION_PENALTY / n
-            - noev * NO_EVIDENCE_PENALTY / n,
-            0.0
-        ), 4)
+
+        base_score = sum(c.score for c in claims) / max(len(claims), 1)
+        return round(max(min(base_score, 1.0), 0.0), 4)
+
+    def score_to_label(self, score: float) -> VerificationLabel:
+        if score >= 0.75:
+            return VerificationLabel.VERIFIED
+        if score >= 0.40:
+            return VerificationLabel.UNCERTAIN
+        if score > 0.0:
+            return VerificationLabel.CONTRADICTED
+        return VerificationLabel.UNSUPPORTED
+
+
 
 
 # ===========================================================================
@@ -1546,20 +1467,20 @@ class ExplanationGenerator:
         if numeric_result in num_msg:
             parts.append(num_msg[numeric_result])
 
-        if label == VerificationLabel.HIGHLY_FACTUAL:
+        if label == VerificationLabel.VERIFIED:
             parts.append(
                 f"Verified by {len(sup_snips)} source(s)"
                 + (f" incl. {len(tier1)} high-authority" if tier1 else "")
                 + f". Subject confirmed in {len(subj_ok)}/{len(snippets)}, "
                 f"relation in {len(rel_ok)}/{len(snippets)}. Consensus."
             )
-        elif label == VerificationLabel.PARTIALLY_CORRECT:
+        elif label == VerificationLabel.UNCERTAIN:
             parts.append(
                 f"{len(sup_snips)} source(s) support the claim but "
                 f"{len(con_snips)} conflict. "
                 f"Subject found in {len(subj_ok)}/{len(snippets)} source(s)."
             )
-        elif label == VerificationLabel.UNCERTAIN:
+        elif label == VerificationLabel.UNSUPPORTED:
             parts.append(
                 f"Evidence across {len(snippets)} source(s) is inconclusive. "
                 f"Subject matched in {len(subj_ok)}, relation in {len(rel_ok)}."
@@ -1577,7 +1498,7 @@ class ExplanationGenerator:
                     "No source confirms this relational fact after subject-anchored retrieval."
                 )
 
-        if label != VerificationLabel.LIKELY_HALLUCINATED or not con_snips:
+        if label != VerificationLabel.CONTRADICTED or not con_snips:
             decisive = (sup_snips or con_snips or snippets)[0]
             snip = decisive.snippet[:200].rstrip() + ("…" if len(decisive.snippet) > 200 else "")
             parts.append(f'Key evidence from {_domain(decisive.source_url)}: "{snip}"')
@@ -1763,19 +1684,22 @@ class VerificationOrchestrator:
 
                 numeric_result = _best_numeric_result(annotated)
 
-                score = self._calibrator.compute_claim_score(
-                    nli=nli, llm_judge=llm_j,
-                    source_weight=src_w, cross_agreement=cross_a,
-                    relation_score=rel_score,
-                    numeric_result=numeric_result,
-                    has_evidence=has_evidence,
-                    analysis=analysis,
-                    snippets=annotated,
-                )
-                label       = self._calibrator.score_to_label(score)
-                explanation = self._explainer.generate(
-                    claim, annotated, score, label, numeric_result
-                )
+                try:
+                    score_input = ClaimScoreInput(
+                        nli=nli,
+                        has_evidence=has_evidence,
+                        evidence=annotated,
+                    )
+                    score = self._calibrator.compute_claim_score(score_input)
+                    label = self._calibrator.score_to_label(score)
+                    explanation = self._explainer.generate(
+                        claim, annotated, score, label, numeric_result
+                    )
+                except Exception as exc:
+                    logger.warning("Scoring/label/explain failed: %s", exc)
+                    score = 0.0
+                    label = VerificationLabel.UNKNOWN
+                    explanation = "Verification failed for this claim due to an internal scoring error."
 
                 subj_validated = any(
                     s.subject_match_score >= SUBJECT_MATCH_THRESHOLD for s in annotated
