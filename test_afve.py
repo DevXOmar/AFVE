@@ -596,17 +596,69 @@ class TestScoringCalibrator:
     def test_label_partially_correct(self):
         cal = self._cal()
         assert cal.score_to_label(0.74).value == "MOSTLY_TRUE"
-        assert cal.score_to_label(0.65).value == "MOSTLY_TRUE"
+        assert cal.score_to_label(0.70).value == "MOSTLY_TRUE"
 
     def test_label_uncertain(self):
         cal = self._cal()
+        assert cal.score_to_label(0.65).value == "UNCERTAIN"
         assert cal.score_to_label(0.50).value == "UNCERTAIN"
-        assert cal.score_to_label(0.40).value == "UNCERTAIN"
+        assert cal.score_to_label(0.49).value == "LIKELY_FALSE"
 
     def test_label_likely_hallucinated(self):
         cal = self._cal()
         assert cal.score_to_label(0.30).value == "LIKELY_FALSE"
         assert cal.score_to_label(0.0).value == "UNSUPPORTED"
+
+    def test_explanation_mode_boosts_supported_conceptual_claims(self):
+        from agents import ClaimScoreInput
+        from models import ClaimCategory, CredibilityTier, EntailmentStatus, EvidenceSnippet, VerificationMode
+
+        cal = self._cal()
+        evidence = EvidenceSnippet(
+            source_url="https://en.wikipedia.org/wiki/Quantum_mechanics",
+            snippet="Quantum mechanics describes how particles behave at very small scales.",
+            credibility_tier=CredibilityTier.TIER_1,
+            entailment_status=EntailmentStatus.NEUTRAL,
+            semantic_score=0.72,
+            relation_match_score=0.78,
+            subject_match_score=1.0,
+        )
+
+        score = cal.compute_claim_score(ClaimScoreInput(
+            nli=0.52,
+            has_evidence=True,
+            evidence=[evidence],
+            claim_category=ClaimCategory.CONCEPTUAL,
+            verification_mode=VerificationMode.EXPLANATION,
+            relation_verified=True,
+            subject_validated=True,
+            domain="physics",
+        ))
+        assert score >= 0.72
+
+    def test_high_confidence_override_for_strong_support(self):
+        from agents import ClaimScoreInput
+        from models import CredibilityTier, EntailmentStatus, EvidenceSnippet
+
+        cal = self._cal()
+        evidence = EvidenceSnippet(
+            source_url="https://en.wikipedia.org/wiki/Speed_of_light",
+            snippet="The speed of light in vacuum is 299,792 kilometres per second.",
+            credibility_tier=CredibilityTier.TIER_1,
+            entailment_status=EntailmentStatus.WEAK_SUPPORT,
+            semantic_score=0.80,
+            relation_match_score=0.85,
+            subject_match_score=1.0,
+        )
+        score = cal.compute_claim_score(ClaimScoreInput(
+            nli=0.61,
+            has_evidence=True,
+            evidence=[evidence],
+            relation_verified=True,
+            subject_validated=True,
+            domain="physics",
+        ))
+        assert score >= 0.8
 
     def test_overall_score_average_no_penalty(self):
         from models import VerifiedClaim, VerificationLabel
@@ -624,7 +676,7 @@ class TestScoringCalibrator:
             claim(0.7, VerificationLabel.UNCERTAIN),
         ]
         score = cal.compute_overall_score(claims)
-        assert score == pytest.approx(0.75, abs=1e-4)
+        assert score == pytest.approx(0.8, abs=1e-4)
 
     def test_overall_score_never_below_zero(self):
         from models import VerifiedClaim, VerificationLabel
@@ -721,6 +773,25 @@ class TestExplanationGenerator:
             make_resolved_claim(), [s1, s2], 0.6, VerificationLabel.UNCERTAIN
         )
         assert "conflict" in exp.lower() or "contradict" in exp.lower()
+
+
+class TestVerificationUtilities:
+    def test_detect_verification_mode_marks_explanations(self):
+        from agents import _detect_verification_mode
+        from models import VerificationMode
+
+        assert _detect_verification_mode("Tell me about quantum mechanics") == VerificationMode.EXPLANATION
+        assert _detect_verification_mode("How do vaccines work?") == VerificationMode.EXPLANATION
+
+    def test_numeric_text_comparison_handles_unit_conversion(self):
+        from agents import _compare_numeric_texts
+        from models import ComparisonResult
+
+        result = _compare_numeric_texts(
+            "The speed of light is 299,792 km/s.",
+            "The speed of light is approximately 3 x 10^8 m/s in vacuum.",
+        )
+        assert result in {ComparisonResult.MATCHES, ComparisonResult.CLOSE}
 
 
 # ===========================================================================

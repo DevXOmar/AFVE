@@ -98,6 +98,17 @@ class ClaimType(str, Enum):
     GENERAL = "general"
 
 
+class ClaimCategory(str, Enum):
+    FACTUAL = "factual"
+    CONCEPTUAL = "conceptual"
+    ABSTRACT = "abstract"
+
+
+class VerificationMode(str, Enum):
+    FACTUAL = "factual"
+    EXPLANATION = "explanation"
+
+
 class EntityLabel(str, Enum):
     PERSON = "PERSON"
     ORG = "ORG"
@@ -195,6 +206,7 @@ class RelationalAnalysis(BaseModel):
     Replaces the old flat ClaimAnalysis.
     """
     claim_type: ClaimType
+    claim_category: ClaimCategory = ClaimCategory.FACTUAL
     triple: RelationalTriple
     atomic_claim_text: str              # the specific sub-claim being verified
     # Subject-first queries (always query by subject, not object)
@@ -281,6 +293,9 @@ class ResolvedClaim(BaseModel):
     sentence_index: int
     atom_index: int = 0
     analysis: RelationalAnalysis | None = None
+    relevance_score: Annotated[float, Field(ge=0.0, le=1.0)] = 0.0
+    claim_weight: Annotated[float, Field(ge=0.0, le=1.0)] = 0.6
+    verification_mode: VerificationMode = VerificationMode.FACTUAL
 
 
 class EvidenceSnippet(BaseModel):
@@ -385,12 +400,15 @@ class VerifiedClaim(BaseModel):
     evidence: list[EvidenceSnippet]
 
     claim_type: ClaimType = ClaimType.GENERAL
+    claim_category: ClaimCategory = ClaimCategory.FACTUAL
     triple: RelationalTriple | None = None
     entities: list[EntitySpan] = Field(default_factory=list)
     numeric_assertions: list[NumericAssertion] = Field(default_factory=list)
     numeric_comparison: ComparisonResult = ComparisonResult.NOT_FOUND
     top_supporting_evidence: list[EvidenceSnippet] = Field(default_factory=list)
     top_contradicting_evidence: list[EvidenceSnippet] = Field(default_factory=list)
+    relevance_score: Annotated[float, Field(ge=0.0, le=1.0)] = 0.0
+    claim_weight: Annotated[float, Field(ge=0.0, le=1.0)] = 0.6
 
     subject_validated: bool = False   # subject found in ≥1 snippet
     relation_verified: bool = False   # predicate confirmed in evidence
@@ -424,6 +442,7 @@ class JobMetadata(BaseModel):
     retrieval_failures: int = 0
     no_evidence_claims: int = 0
     relation_unverified_count: int = 0
+    verification_mode: VerificationMode = VerificationMode.FACTUAL
 
 
 class VerificationReport(BaseModel):
@@ -439,6 +458,8 @@ class VerificationReport(BaseModel):
     factuality_percentage: Annotated[float | None, Field(ge=0.0, le=100.0)] = None
     factuality_rating: str | None = None
     sources_used: list[str] = Field(default_factory=list)
+    mode: VerificationMode = VerificationMode.FACTUAL
+    scoring_note: str | None = None
 
     @model_validator(mode="after")
     def populate_uncertainty_signals(self) -> VerificationReport:
@@ -545,12 +566,12 @@ def _score_to_rating(score_percent: float | None) -> str | None:
     if score_percent is None:
         return None
     if score_percent >= 85.0:
-        return "VERIFIED"
-    if score_percent >= 65.0:
-        return "MOSTLY_TRUE"
-    if score_percent >= 40.0:
-        return "Uncertain"
-    return "LIKELY_FALSE"
+        return "Highly Reliable"
+    if score_percent >= 70.0:
+        return "Mostly True"
+    if score_percent >= 50.0:
+        return "Acceptable / Mixed"
+    return "Likely Incorrect"
 
 class OllamaGenerateRequest(BaseModel):
     model: str

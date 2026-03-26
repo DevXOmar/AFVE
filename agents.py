@@ -88,6 +88,7 @@ from config import (
 )
 from models import (
     AtomicClaim,
+    ClaimCategory,
     ClaimType,
     ComparisonResult,
     CredibilityTier,
@@ -103,6 +104,7 @@ from models import (
     RelationalTriple,
     ResolvedClaim,
     RetrievalResult,
+    VerificationMode,
     VerificationLabel,
     VerificationReport,
     VerificationRequest,
@@ -170,6 +172,66 @@ _PREDICATE_SYNONYMS: dict[ClaimType, frozenset[str]] = {
     }),
     ClaimType.EXISTENCE: frozenset({"is", "are", "exists", "real", "actual"}),
     ClaimType.GENERAL: frozenset(),
+}
+
+_SCIENCE_DOMAIN_TERMS: dict[str, frozenset[str]] = {
+    "physics": frozenset({
+        "physics", "quantum", "relativity", "gravity", "force", "mass",
+        "energy", "particle", "photon", "light", "speed", "acceleration",
+        "vacuum", "momentum", "wave", "atom",
+    }),
+    "biology": frozenset({
+        "biology", "cell", "cells", "dna", "genetic", "gene", "protein",
+        "organism", "organisms", "evolution", "vaccine", "immune",
+        "photosynthesis", "mitochondria", "bacteria", "virus",
+    }),
+    "science": frozenset({
+        "science", "scientific", "theory", "experiment", "evidence",
+        "research", "mechanics", "chemistry", "chemical", "molecule",
+    }),
+}
+
+_UNIT_ALIASES: dict[str, tuple[str, float, NumericUnit]] = {
+    "%": ("percent", 1.0, NumericUnit.PERCENT),
+    "percent": ("percent", 1.0, NumericUnit.PERCENT),
+    "km": ("distance_m", 1000.0, NumericUnit.DISTANCE),
+    "kilometer": ("distance_m", 1000.0, NumericUnit.DISTANCE),
+    "kilometers": ("distance_m", 1000.0, NumericUnit.DISTANCE),
+    "kilometre": ("distance_m", 1000.0, NumericUnit.DISTANCE),
+    "kilometres": ("distance_m", 1000.0, NumericUnit.DISTANCE),
+    "m": ("distance_m", 1.0, NumericUnit.DISTANCE),
+    "meter": ("distance_m", 1.0, NumericUnit.DISTANCE),
+    "meters": ("distance_m", 1.0, NumericUnit.DISTANCE),
+    "metre": ("distance_m", 1.0, NumericUnit.DISTANCE),
+    "metres": ("distance_m", 1.0, NumericUnit.DISTANCE),
+    "mile": ("distance_m", 1609.34, NumericUnit.DISTANCE),
+    "miles": ("distance_m", 1609.34, NumericUnit.DISTANCE),
+    "mi": ("distance_m", 1609.34, NumericUnit.DISTANCE),
+    "kg": ("weight_kg", 1.0, NumericUnit.WEIGHT),
+    "kilogram": ("weight_kg", 1.0, NumericUnit.WEIGHT),
+    "kilograms": ("weight_kg", 1.0, NumericUnit.WEIGHT),
+    "g": ("weight_kg", 0.001, NumericUnit.WEIGHT),
+    "gram": ("weight_kg", 0.001, NumericUnit.WEIGHT),
+    "grams": ("weight_kg", 0.001, NumericUnit.WEIGHT),
+    "lb": ("weight_kg", 0.45359237, NumericUnit.WEIGHT),
+    "lbs": ("weight_kg", 0.45359237, NumericUnit.WEIGHT),
+    "pound": ("weight_kg", 0.45359237, NumericUnit.WEIGHT),
+    "pounds": ("weight_kg", 0.45359237, NumericUnit.WEIGHT),
+    "km/s": ("speed_m_per_s", 1000.0, NumericUnit.DISTANCE),
+    "kilometers/second": ("speed_m_per_s", 1000.0, NumericUnit.DISTANCE),
+    "kilometres/second": ("speed_m_per_s", 1000.0, NumericUnit.DISTANCE),
+    "m/s": ("speed_m_per_s", 1.0, NumericUnit.DISTANCE),
+    "meters/second": ("speed_m_per_s", 1.0, NumericUnit.DISTANCE),
+    "metres/second": ("speed_m_per_s", 1.0, NumericUnit.DISTANCE),
+    "m/s2": ("acceleration_m_per_s2", 1.0, NumericUnit.DISTANCE),
+    "m/s^2": ("acceleration_m_per_s2", 1.0, NumericUnit.DISTANCE),
+    "m/s²": ("acceleration_m_per_s2", 1.0, NumericUnit.DISTANCE),
+    "meters/second^2": ("acceleration_m_per_s2", 1.0, NumericUnit.DISTANCE),
+    "metres/second^2": ("acceleration_m_per_s2", 1.0, NumericUnit.DISTANCE),
+    "c": ("temperature_c", 1.0, NumericUnit.NONE),
+    "°c": ("temperature_c", 1.0, NumericUnit.NONE),
+    "f": ("temperature_f", 1.0, NumericUnit.NONE),
+    "°f": ("temperature_f", 1.0, NumericUnit.NONE),
 }
 
 # ---------------------------------------------------------------------------
@@ -546,12 +608,14 @@ class RelationalDecomposer:
             triple = await self._extract_triple_llm(text) or triple
 
         claim_type = self._classify(text, triple)
+        claim_category = self._categorize_claim(text, triple, claim_type)
         numerics   = self._extract_numerics(text, claim_type)
         prior      = CLAIM_TYPE_TRUTH_PRIORS.get(claim_type.value, 0.60)
         queries    = self._build_queries(triple, claim_type, text)
 
         return RelationalAnalysis(
             claim_type=claim_type,
+            claim_category=claim_category,
             triple=triple,
             atomic_claim_text=text,
             subject_queries=queries,
@@ -683,6 +747,29 @@ class RelationalDecomposer:
             return ClaimType.EXISTENCE
         return ClaimType.GENERAL
 
+    def _categorize_claim(
+        self,
+        text: str,
+        triple: RelationalTriple,
+        claim_type: ClaimType,
+    ) -> ClaimCategory:
+        lower = text.lower()
+        if _is_analogy_or_stylistic(lower):
+            return ClaimCategory.ABSTRACT
+        if re.search(r"\b(1[0-9]{3}|20[0-2][0-9]|\d+(?:\.\d+)?)\b", text):
+            return ClaimCategory.FACTUAL
+        if claim_type in {ClaimType.DATE, ClaimType.AUTHORSHIP, ClaimType.ROLE, ClaimType.MEMBERSHIP, ClaimType.LOCATION}:
+            return ClaimCategory.FACTUAL
+        conceptual_markers = (
+            "explains", "describes", "means", "refers to", "behavior", "process",
+            "system", "theory", "mechanics", "works", "happens", "occurs",
+        )
+        if any(marker in lower for marker in conceptual_markers):
+            return ClaimCategory.CONCEPTUAL
+        if triple.subject and not triple.qualifier and not re.search(r"\b(founded|published|born|died|invented|created)\b", lower):
+            return ClaimCategory.CONCEPTUAL
+        return ClaimCategory.FACTUAL
+
     def _extract_numerics(
         self, text: str, claim_type: ClaimType
     ) -> list[NumericAssertion]:
@@ -809,6 +896,7 @@ class ClaimExtractionAgent:
     def __init__(self, llm_client=None, decomposer=None) -> None:
         self._llm = llm_client
         self._decomposer = decomposer or RelationalDecomposer(llm_client=llm_client)
+        self._max_claims = 6
 
     def is_verifiable(self, text: str) -> bool:
         """Rule-based classifier to reject questions, opinions, and conversational text."""
@@ -906,6 +994,7 @@ class ClaimExtractionAgent:
             return fallback
 
     async def extract(self, request: VerificationRequest) -> list[ResolvedClaim]:
+        mode = _detect_verification_mode(request.prompt)
         raw = self._split_sentences(request.model_output)
         verifiable = [c for c in raw if c.is_verifiable]
         logger.info("Extracted %d verifiable / %d total sentences.", len(verifiable), len(raw))
@@ -933,13 +1022,33 @@ class ClaimExtractionAgent:
                 logger.warning("Decomposition error sentence %d: %s", i, res)
                 continue
             for atom in res:
+                if atom.analysis and atom.analysis.claim_category == ClaimCategory.ABSTRACT and _is_analogy_or_stylistic(atom.atomic_text.lower()):
+                    continue
+                relevance = _claim_relevance_score(request.prompt, atom.atomic_text, atom.analysis)
+                if relevance < 0.20:
+                    continue
                 claims.append(ResolvedClaim(
                     original_text=atom.original_sentence,
                     contextualized_text=atom.atomic_text,
                     sentence_index=atom.sentence_index,
                     atom_index=atom.atom_index,
                     analysis=atom.analysis,
+                    relevance_score=relevance,
+                    claim_weight=_claim_weight_from_relevance(relevance, atom.analysis),
+                    verification_mode=mode,
                 ))
+
+        claims = _dedupe_claims(claims)
+        claims.sort(
+            key=lambda c: (
+                c.claim_weight,
+                c.relevance_score,
+                1.0 if (c.analysis and c.analysis.triple.qualifier) else 0.0,
+                1.0 if (c.analysis and c.analysis.triple.subject) else 0.0,
+            ),
+            reverse=True,
+        )
+        claims = claims[:self._max_claims]
 
         logger.info("Generated %d atomic claims from %d sentences.", len(claims), len(verifiable))
         return claims
@@ -1049,11 +1158,19 @@ class RetrievalAgent:
             logger.info("Attempt %d: %d snippets; retrying.", attempt + 1, len(snippets))
 
         # Score relational match for every snippet
+        key_terms = _claim_key_terms(claim.contextualized_text, triple)
         for s in snippets:
             s.subject_match_score  = _score_presence(s.snippet, triple.subject)
             s.object_match_score   = _score_presence(s.snippet, triple.object)
             s.relation_match_score = _score_predicate(s.snippet, triple.predicate, ctype)
             s.claim_type = ctype
+
+        filtered_snippets = [
+            s for s in snippets
+            if _passes_evidence_quality_filter(s.snippet, triple.subject, key_terms)
+        ]
+        if filtered_snippets:
+            snippets = filtered_snippets
 
         # Evidence flow variables (debuggable): raw_snippets -> reranked_snippets -> final_evidence
         raw_snippets: list[EvidenceSnippet] = list(snippets)
@@ -1375,6 +1492,9 @@ class VerificationEngine:
         claim_text = retrieval.claim.contextualized_text
         snippets   = retrieval.snippets
         analysis   = retrieval.claim.analysis
+        mode = getattr(retrieval.claim, "verification_mode", VerificationMode.FACTUAL)
+        domain = _detect_claim_domain(claim_text)
+        relaxed_semantics = mode == VerificationMode.EXPLANATION or domain in {"science", "physics", "biology"}
 
         if not snippets:
             # Safety: always return at least one evidence snippet.
@@ -1440,7 +1560,7 @@ class VerificationEngine:
             for sent in _split_sentences(s.snippet):
                 if _is_generic_sentence(sent):
                     continue
-                if not _sentence_is_candidate(sent, required_subject, key_terms):
+                if not _sentence_is_candidate(sent, required_subject, key_terms, allow_relaxed=relaxed_semantics):
                     continue
                 candidates.append((s, sent))
 
@@ -1448,11 +1568,11 @@ class VerificationEngine:
             # Fallback: use the original snippets as candidates.
             for s in top_snippets:
                 sentence = (s.snippet or "").strip()
-                if sentence and _sentence_is_candidate(sentence, required_subject, key_terms, allow_relaxed=True):
+                if sentence and _sentence_is_candidate(sentence, required_subject, key_terms, allow_relaxed=relaxed_semantics):
                     candidates.append((s, sentence))
 
         scored: list[tuple[float, EvidenceSnippet, str]] = [
-            (_candidate_alignment_score(claim_text, sent, triple), parent, sent)
+            (_candidate_alignment_score(claim_text, sent, triple, allow_relaxed=relaxed_semantics), parent, sent)
             for parent, sent in candidates
         ]
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -1522,6 +1642,8 @@ class VerificationEngine:
     def _score_snippet_sync(self, nli_hyp: str, snippet: EvidenceSnippet) -> EvidenceSnippet:
         # Load NLI correctly from the global single instance
         pipeline = _get_nli_pipeline()
+        numeric_result = _compare_numeric_texts(nli_hyp, snippet.snippet)
+        snippet.numeric_result = numeric_result
         
         if pipeline:
             try:
@@ -1591,9 +1713,17 @@ class VerificationEngine:
                 except Exception:
                     sem = 0.0
                 keyword_overlap = _keyword_overlap_ratio(nli_hyp, snippet.snippet)
+                relation_match = float(getattr(snippet, "relation_match_score", 0.0) or 0.0)
+                strong_concept_match = relation_match >= 0.65 or sem >= 0.55 or keyword_overlap >= 0.45
 
                 decisive_threshold = 0.65 if sem >= 0.60 else 0.85
-                if sem < 0.35 or subject_match < min_subject_match_for_decision:
+                if numeric_result == ComparisonResult.CONTRADICTS:
+                    status = EntailmentStatus.CONTRADICTS
+                    score = min(score, 0.05)
+                elif numeric_result in {ComparisonResult.MATCHES, ComparisonResult.CLOSE} and subject_match >= 0.70:
+                    status = EntailmentStatus.SUPPORTS
+                    score = max(score, 0.88)
+                elif sem < 0.35 or subject_match < min_subject_match_for_decision:
                     status = EntailmentStatus.NEUTRAL
                 elif label in {"AGREEMENT", "ENTAILMENT", "ENTAIL", "SUPPORTS"} and score >= decisive_threshold:
                     status = EntailmentStatus.SUPPORTS
@@ -1606,18 +1736,32 @@ class VerificationEngine:
                     else:
                         status = EntailmentStatus.NEUTRAL
                 else:
-                    if subject_match >= 0.75 and keyword_overlap >= 0.35:
+                    if subject_match >= 0.75 and strong_concept_match:
                         status = EntailmentStatus.WEAK_SUPPORT
-                        score = max(score, 0.70)
+                        score = max(score, 0.78)
                     else:
                         status = EntailmentStatus.NEUTRAL
             except Exception as e:
                 logger.warning(f"NLI failure: {e}")
+                if numeric_result in {ComparisonResult.MATCHES, ComparisonResult.CLOSE}:
+                    status = EntailmentStatus.SUPPORTS
+                    score = 0.88
+                elif numeric_result == ComparisonResult.CONTRADICTS:
+                    status = EntailmentStatus.CONTRADICTS
+                    score = 0.05
+                else:
+                    status = EntailmentStatus.NEUTRAL
+                    score = 0.5
+        else:
+            if numeric_result in {ComparisonResult.MATCHES, ComparisonResult.CLOSE}:
+                status = EntailmentStatus.SUPPORTS
+                score = 0.88
+            elif numeric_result == ComparisonResult.CONTRADICTS:
+                status = EntailmentStatus.CONTRADICTS
+                score = 0.05
+            else:
                 status = EntailmentStatus.NEUTRAL
                 score = 0.5
-        else:
-            status = EntailmentStatus.NEUTRAL
-            score = 0.5
 
         snippet.entailment_status = status
         snippet.nli_score = score
@@ -1742,6 +1886,13 @@ class ClaimScoreInput:
     nli: float
     has_evidence: bool
     evidence: list[EvidenceSnippet]
+    claim_category: ClaimCategory = ClaimCategory.FACTUAL
+    verification_mode: VerificationMode = VerificationMode.FACTUAL
+    numeric_result: ComparisonResult = ComparisonResult.NOT_FOUND
+    relation_verified: bool = False
+    subject_validated: bool = False
+    truth_prior: float = 0.5
+    domain: str = "general"
 
 
 class ScoringCalibrator:
@@ -1755,6 +1906,11 @@ class ScoringCalibrator:
 
     def compute_claim_score(self, claim: ClaimScoreInput) -> float:
         """Return a deterministic normalized score in [0, 1]."""
+        if claim.claim_category == ClaimCategory.ABSTRACT:
+            if any(s.entailment_status == EntailmentStatus.CONTRADICTS for s in claim.evidence):
+                return 0.0
+            return 0.6
+
         if not claim.has_evidence or not claim.evidence:
             return 0.2
 
@@ -1764,38 +1920,78 @@ class ScoringCalibrator:
         contradicts = any(s.entailment_status == EntailmentStatus.CONTRADICTS for s in top)
         neutrals = any(s.entailment_status == EntailmentStatus.NEUTRAL for s in top)
 
-        if supports:
-            return 1.0
-        if weak_supports:
-            return 0.7
-        if contradicts:
-            return 0.0
-        if neutrals:
-            return 0.5
-        return 0.2
+        best_semantic = max((getattr(s, "semantic_score", 0.0) for s in top), default=0.0)
+        strong_numeric = claim.numeric_result in {ComparisonResult.MATCHES, ComparisonResult.CLOSE}
+        conceptual_mode = claim.verification_mode == VerificationMode.EXPLANATION
+        science_domain = claim.domain in {"science", "physics", "biology"}
+        strong_support = (
+            supports
+            or strong_numeric
+            or any(
+                (
+                    s.entailment_status == EntailmentStatus.WEAK_SUPPORT
+                    and (
+                        getattr(s, "semantic_score", 0.0) >= 0.65
+                        or getattr(s, "relation_match_score", 0.0) >= 0.7
+                    )
+                )
+                for s in top
+            )
+        )
+
+        if contradicts and not (supports or weak_supports or strong_numeric):
+            score = 0.0
+        elif supports:
+            score = 1.0
+        elif strong_support:
+            score = 0.85
+        elif weak_supports:
+            score = 0.7
+        elif neutrals:
+            score = 0.5
+        else:
+            score = 0.2
+
+        if score > 0.0 and claim.claim_category in {ClaimCategory.CONCEPTUAL, ClaimCategory.ABSTRACT}:
+            if conceptual_mode:
+                score = max(score, 0.68 if (science_domain or best_semantic >= 0.55) else 0.62)
+            elif science_domain and best_semantic >= 0.45:
+                score = max(score, 0.65)
+
+        if score > 0.0 and conceptual_mode and science_domain and best_semantic >= 0.45:
+            score = max(score, 0.72)
+
+        if score > 0.0 and claim.subject_validated and claim.relation_verified and best_semantic >= 0.45:
+            score = max(score, 0.75)
+
+        if score > 0.0 and strong_support and not contradicts:
+            score = max(score, 0.8)
+
+        if score > 0.0 and claim.truth_prior >= 0.72 and (supports or strong_support):
+            score = max(score, 0.8)
+
+        return round(max(0.0, min(score, 1.0)), 4)
 
     def compute_overall_score(self, claims: list[VerifiedClaim]) -> float:
         if not claims:
             return 0.0
-        canonical = {
-            VerificationLabel.VERIFIED: 1.0,
-            VerificationLabel.MOSTLY_TRUE: 0.7,
-            VerificationLabel.UNCERTAIN: 0.5,
-            VerificationLabel.LIKELY_FALSE: 0.0,
-            VerificationLabel.CONTRADICTED: 0.0,
-            VerificationLabel.UNSUPPORTED: 0.2,
-            VerificationLabel.UNKNOWN: 0.0,
-            VerificationLabel.NO_VERIFIABLE_CONTENT: 0.0,
-        }
-        base_score = sum(canonical.get(c.label, c.score) for c in claims) / max(len(claims), 1)
+        weighted_sum = 0.0
+        total_weight = 0.0
+        for claim in claims:
+            weight = getattr(claim, "claim_weight", 1.0) or 1.0
+            weighted_sum += claim.score * weight
+            total_weight += weight
+        if total_weight <= 0:
+            return 0.0
+        base_score = weighted_sum / total_weight
         return round(max(min(base_score, 1.0), 0.0), 4)
 
     def score_to_label(self, score: float) -> VerificationLabel:
         if score >= 0.85:
             return VerificationLabel.VERIFIED
-        if score >= 0.65:
+        if score >= 0.70:
             return VerificationLabel.MOSTLY_TRUE
-        if score >= 0.40:
+        if score >= 0.50:
             return VerificationLabel.UNCERTAIN
         if score <= 0.20:
             return VerificationLabel.UNSUPPORTED
@@ -2001,6 +2197,7 @@ class VerificationOrchestrator:
     async def run(self, request: VerificationRequest) -> VerificationReport:
         start  = time.monotonic()
         claims = await self._extractor.extract(request)
+        mode = _detect_verification_mode(request.prompt)
         if not claims:
             logger.warning("[%s] No verifiable atomic claims.", request.job_id)
             elapsed_ms = int((time.monotonic() - start) * 1000)
@@ -2015,11 +2212,14 @@ class VerificationOrchestrator:
                     retrieval_failures=0,
                     no_evidence_claims=0,
                     relation_unverified_count=0,
+                    verification_mode=mode,
                 ),
                 overall_score=None,
                 overall_label=VerificationLabel.NO_VERIFIABLE_CONTENT,
                 claims=[],
-                reasoning="No verifiable claims detected.\n\nReason:\n- No named entities\n- No factual assertions\n- Conversational response"
+                reasoning="No verifiable claims detected.\n\nReason:\n- No named entities\n- No factual assertions\n- Conversational response",
+                mode=mode,
+                scoring_note=_mode_scoring_note(mode),
             )
 
         tasks   = [self._verify_claim(c, request.config) for c in claims]
@@ -2039,11 +2239,14 @@ class VerificationOrchestrator:
                     retrieval_failures=len(claims),
                     no_evidence_claims=len(claims),
                     relation_unverified_count=0,
+                    verification_mode=mode,
                 ),
                 overall_score=0.0,
                 overall_label=VerificationLabel.UNKNOWN,
                 claims=[],
                 reasoning="Claim extraction succeeded, but verification did not produce any usable claim results.",
+                mode=mode,
+                scoring_note=_mode_scoring_note(mode),
             )
 
         overall_score = self._calibrator.compute_overall_score(valid)
@@ -2083,22 +2286,27 @@ class VerificationOrchestrator:
         deduped.sort(key=_global_sort, reverse=True)
         top_global_evidence = deduped[:5]
 
+        valid.sort(key=lambda c: (c.claim_weight, c.relevance_score, c.score), reverse=True)
+
         return VerificationReport(
             metadata=JobMetadata(
                 job_id=request.job_id,
                 processing_time_ms=elapsed_ms,
-                sources_queried=len(all_evidence),
+                sources_queried=len({e.source_url for e in all_evidence}),
                 claims_extracted=len(claims),
                 atoms_generated=len(claims),
                 claims_verified=len(valid),
                 retrieval_failures=no_ev,
                 no_evidence_claims=no_ev,
                 relation_unverified_count=rel_unverif,
+                verification_mode=mode,
             ),
             overall_score=overall_score,
             overall_label=overall_label,
             claims=valid,
             global_evidence=top_global_evidence,
+            mode=mode,
+            scoring_note=_mode_scoring_note(mode),
         )
 
     async def _verify_claim(
@@ -2118,19 +2326,31 @@ class VerificationOrchestrator:
                     nli, llm_j, src_w, cross_a, rel_score, annotated = verify_out  # type: ignore[misc]
 
                 numeric_result = _best_numeric_result(annotated)
-                top_evidence = _rank_claim_evidence(annotated)[:3]
+                top_evidence = _rank_claim_evidence(annotated)[:2]
                 supporting = [s for s in top_evidence if s.entailment_status in {EntailmentStatus.SUPPORTS, EntailmentStatus.WEAK_SUPPORT}][:3]
                 contradicting = [s for s in top_evidence if s.entailment_status == EntailmentStatus.CONTRADICTS][:3]
                 has_relevant_evidence = bool(top_evidence)
+                subj_validated = any(
+                    s.subject_match_score >= SUBJECT_MATCH_THRESHOLD for s in top_evidence
+                )
+                rel_verified = any(s.relation_match_score > 0.4 for s in top_evidence)
+                domain = _detect_claim_domain(claim.contextualized_text)
 
                 try:
                     score_input = ClaimScoreInput(
                         nli=nli,
                         has_evidence=has_relevant_evidence,
                         evidence=top_evidence,
+                        claim_category=analysis.claim_category if analysis else ClaimCategory.FACTUAL,
+                        verification_mode=getattr(claim, "verification_mode", VerificationMode.FACTUAL),
+                        numeric_result=numeric_result,
+                        relation_verified=rel_verified,
+                        subject_validated=subj_validated,
+                        truth_prior=analysis.truth_prior if analysis else 0.60,
+                        domain=domain,
                     )
                     score = self._calibrator.compute_claim_score(score_input)
-                    label = _claim_label_from_evidence(top_evidence, has_evidence)
+                    label = _claim_label_from_score_and_evidence(score, top_evidence, has_relevant_evidence)
                     explanation = self._explainer.generate(
                         claim, top_evidence, score, label, numeric_result
                     )
@@ -2139,11 +2359,6 @@ class VerificationOrchestrator:
                     score = 0.0
                     label = VerificationLabel.UNKNOWN
                     explanation = "Verification failed for this claim due to an internal scoring error."
-
-                subj_validated = any(
-                    s.subject_match_score >= SUBJECT_MATCH_THRESHOLD for s in top_evidence
-                )
-                rel_verified = any(s.relation_match_score > 0.4 for s in top_evidence)
 
                 # Build entity list from triple
                 entities: list[EntitySpan] = []
@@ -2166,12 +2381,15 @@ class VerificationOrchestrator:
                     explanation=explanation,
                     evidence=top_evidence,
                     claim_type=analysis.claim_type if analysis else ClaimType.GENERAL,
+                    claim_category=analysis.claim_category if analysis else ClaimCategory.FACTUAL,
                     triple=analysis.triple if analysis else None,
                     entities=entities,
                     numeric_assertions=analysis.numeric_assertions if analysis else [],
                     numeric_comparison=numeric_result,
                     top_supporting_evidence=supporting,
                     top_contradicting_evidence=contradicting,
+                    relevance_score=getattr(claim, "relevance_score", 0.0),
+                    claim_weight=getattr(claim, "claim_weight", 0.6),
                     subject_validated=subj_validated,
                     relation_verified=rel_verified,
                     has_evidence=has_relevant_evidence,
@@ -2264,6 +2482,73 @@ def _content_tokens(text: str) -> list[str]:
     ]
 
 
+def _question_focus_terms(prompt: str) -> set[str]:
+    prompt_tokens = _content_tokens(prompt)
+    generic_q = {
+        "who", "what", "when", "where", "which", "why", "how",
+        "tell", "about", "explain", "describe", "give",
+    }
+    return {t for t in prompt_tokens if t not in generic_q}
+
+
+def _claim_relevance_score(
+    prompt: str,
+    claim_text: str,
+    analysis: RelationalAnalysis | None,
+) -> float:
+    focus_terms = _question_focus_terms(prompt)
+    claim_terms = set(_content_tokens(claim_text))
+    triple = analysis.triple if analysis else RelationalTriple()
+
+    subject_terms = set(_content_tokens(triple.subject))
+    object_terms = set(_content_tokens(triple.object))
+    qualifier_terms = set(_content_tokens(triple.qualifier))
+    predicate_terms = set(_content_tokens(triple.predicate))
+
+    if not focus_terms:
+        return 0.6 if claim_terms else 0.0
+
+    overlap = len(focus_terms & claim_terms) / max(len(focus_terms), 1)
+    direct_bonus = 0.0
+    if subject_terms & focus_terms:
+        direct_bonus += 0.35
+    if object_terms & focus_terms:
+        direct_bonus += 0.20
+    if predicate_terms & focus_terms:
+        direct_bonus += 0.15
+    if qualifier_terms & focus_terms:
+        direct_bonus += 0.20
+    if re.search(r"\bwhen\b", prompt.lower()) and qualifier_terms:
+        direct_bonus += 0.20
+    if re.search(r"\bwho\b", prompt.lower()) and subject_terms:
+        direct_bonus += 0.20
+
+    return round(min(1.0, overlap + direct_bonus), 4)
+
+
+def _claim_weight_from_relevance(
+    relevance: float,
+    analysis: RelationalAnalysis | None,
+) -> float:
+    if relevance >= 0.75:
+        return 1.0
+    if relevance >= 0.40:
+        return 0.6
+    return 0.3
+
+
+def _dedupe_claims(claims: list[ResolvedClaim]) -> list[ResolvedClaim]:
+    deduped: list[ResolvedClaim] = []
+    seen: set[str] = set()
+    for claim in claims:
+        key = re.sub(r"\s+", " ", claim.contextualized_text.strip().lower())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(claim)
+    return deduped
+
+
 def _keyword_overlap_ratio(claim_text: str, evidence_text: str) -> float:
     claim_tokens = set(_content_tokens(claim_text))
     evidence_tokens = set(_content_tokens(evidence_text))
@@ -2278,6 +2563,38 @@ def _claim_key_terms(claim_text: str, triple: RelationalTriple) -> set[str]:
     tokens.update(_content_tokens(triple.object))
     tokens.update(_content_tokens(triple.qualifier))
     return tokens
+
+
+def _detect_claim_domain(text: str) -> str:
+    tokens = set(_content_tokens(text))
+    best_domain = "general"
+    best_overlap = 0
+    for domain, vocab in _SCIENCE_DOMAIN_TERMS.items():
+        overlap = len(tokens & vocab)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_domain = domain
+    return best_domain
+
+
+def _passes_evidence_quality_filter(
+    text: str,
+    subject: str,
+    key_terms: set[str],
+) -> bool:
+    if not text or _subject_match_ratio(subject, text) < 0.5:
+        return False
+    overlap = set(_content_tokens(text)) & key_terms
+    if not overlap:
+        return False
+    lower = text.lower()
+    generic_patterns = (
+        "may refer to",
+        "may also refer to",
+        "can refer to",
+        "is a term used",
+    )
+    return not any(pat in lower for pat in generic_patterns)
 
 
 def _subject_match_ratio(subject: str, sentence: str) -> float:
@@ -2299,7 +2616,12 @@ def _sentence_is_candidate(
     return overlap >= (1 if allow_relaxed else 2)
 
 
-def _candidate_alignment_score(claim_text: str, sentence: str, triple: RelationalTriple) -> float:
+def _candidate_alignment_score(
+    claim_text: str,
+    sentence: str,
+    triple: RelationalTriple,
+    allow_relaxed: bool = False,
+) -> float:
     overlap = _keyword_overlap_ratio(claim_text, sentence)
     subject_score = _subject_match_ratio(triple.subject, sentence)
     predicate_score = _score_predicate(sentence, triple.predicate, ClaimType.GENERAL)
@@ -2307,7 +2629,8 @@ def _candidate_alignment_score(claim_text: str, sentence: str, triple: Relationa
     if triple.qualifier and _content_tokens(triple.qualifier):
         numeric_bonus = 0.20 if any(tok in set(_content_tokens(sentence)) for tok in _content_tokens(triple.qualifier)) else 0.0
     generic_penalty = 0.25 if re.search(r"\bis\s+(an?|the)\b", sentence.lower()) and predicate_score < 0.7 else 0.0
-    return max(0.0, overlap * 0.45 + subject_score * 0.30 + predicate_score * 0.25 + numeric_bonus - generic_penalty)
+    relaxed_bonus = 0.10 if allow_relaxed and overlap >= 0.35 else 0.0
+    return max(0.0, overlap * 0.45 + subject_score * 0.30 + predicate_score * 0.25 + numeric_bonus + relaxed_bonus - generic_penalty)
 
 
 def _rank_claim_evidence(snippets: list[EvidenceSnippet]) -> list[EvidenceSnippet]:
@@ -2348,6 +2671,181 @@ def _claim_label_from_evidence(
     if neutrals:
         return VerificationLabel.UNCERTAIN
     return VerificationLabel.UNSUPPORTED
+
+
+def _claim_label_from_score_and_evidence(
+    score: float,
+    evidence: list[EvidenceSnippet],
+    retrieval_succeeded: bool,
+) -> VerificationLabel:
+    if not retrieval_succeeded or not evidence:
+        return VerificationLabel.UNSUPPORTED
+    contradicts = [e for e in evidence if e.entailment_status == EntailmentStatus.CONTRADICTS]
+    supports = [e for e in evidence if e.entailment_status in {EntailmentStatus.SUPPORTS, EntailmentStatus.WEAK_SUPPORT}]
+    if contradicts and not supports:
+        return VerificationLabel.CONTRADICTED
+    if score >= 0.85:
+        return VerificationLabel.VERIFIED
+    if score >= 0.70:
+        return VerificationLabel.MOSTLY_TRUE
+    if score >= 0.50:
+        return VerificationLabel.UNCERTAIN
+    return VerificationLabel.LIKELY_FALSE
+
+
+def _detect_verification_mode(prompt: str) -> VerificationMode:
+    lower = (prompt or "").lower()
+    explanation_markers = (
+        "explain", "describe", "in simple terms", "simple terms",
+        "how", "what is", "why does", "why do", "tell me about",
+    )
+    if any(marker in lower for marker in explanation_markers):
+        return VerificationMode.EXPLANATION
+    return VerificationMode.FACTUAL
+
+
+def _mode_scoring_note(mode: VerificationMode) -> str:
+    if mode == VerificationMode.EXPLANATION:
+        return "This response contains simplified explanations; scoring adjusted accordingly."
+    return "Strict factual verification mode applied."
+
+
+def _is_analogy_or_stylistic(text: str) -> bool:
+    lower = (text or "").lower()
+    markers = (
+        "like a", "like an", "as if", "imagine", "you can think of",
+        "sort of", "kind of", "similar to",
+    )
+    return any(marker in lower for marker in markers)
+
+
+def _normalize_quantity_text(text: str) -> str:
+    cleaned = (text or "").lower()
+    replacements = {
+        "×": " x ",
+        "·": ".",
+        " per second squared": "/second^2",
+        " per second": "/second",
+        " kilometers per second": " km/s",
+        " kilometres per second": " km/s",
+        " meters per second": " m/s",
+        " metres per second": " m/s",
+        " meters per second squared": " m/s^2",
+        " metres per second squared": " m/s^2",
+        " degrees celsius": " c",
+        " degree celsius": " c",
+        " degrees fahrenheit": " f",
+        " degree fahrenheit": " f",
+    }
+    for src, dst in replacements.items():
+        cleaned = cleaned.replace(src, dst)
+    return cleaned
+
+
+def _parse_numeric_value(raw: str) -> float | None:
+    text = (raw or "").strip().lower().replace(",", "")
+    sci_match = re.match(
+        r"^([+-]?\d+(?:\.\d+)?)\s*(?:x|e)\s*10\^?\s*([+-]?\d+)$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if sci_match:
+        base = float(sci_match.group(1))
+        exp = int(sci_match.group(2))
+        return base * (10 ** exp)
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _extract_quantities(text: str) -> list[tuple[float, str, NumericUnit]]:
+    normalized = _normalize_quantity_text(text)
+    pattern = re.compile(
+        r"(?P<value>[+-]?\d[\d,]*(?:\.\d+)?(?:\s*(?:x|e)\s*10\^?\s*[+-]?\d+)?)"
+        r"\s*(?P<unit>m/s²|m/s\^2|m/s2|km/s|m/s|km|kilometers|kilometres|kilometer|kilometre|"
+        r"meters|metres|meter|metre|miles|mile|mi|kg|kilograms|kilogram|grams|gram|g|"
+        r"lbs|lb|pounds|pound|%|percent|°c|°f|c|f|years|year|employees|people|users|bones|states)?",
+        flags=re.IGNORECASE,
+    )
+    results: list[tuple[float, str, NumericUnit]] = []
+    for match in pattern.finditer(normalized):
+        value = _parse_numeric_value(match.group("value"))
+        if value is None:
+            continue
+        raw_unit = (match.group("unit") or "").strip().lower()
+        if raw_unit in {"years"}:
+            raw_unit = "year"
+        alias = _UNIT_ALIASES.get(raw_unit)
+        if alias:
+            canonical_unit, multiplier, numeric_unit = alias
+            value *= multiplier
+            results.append((value, canonical_unit, numeric_unit))
+            continue
+        if raw_unit in {"employees", "people", "users", "bones", "states"}:
+            results.append((value, "count", NumericUnit.COUNT))
+            continue
+        if 1000 <= value <= 2099 and not raw_unit:
+            results.append((value, "year", NumericUnit.YEAR))
+            continue
+        results.append((value, "count", NumericUnit.NONE))
+    return results
+
+
+def _evaluate_numeric_pair(
+    claimed: tuple[float, str, NumericUnit],
+    evidence: tuple[float, str, NumericUnit],
+) -> ComparisonResult | None:
+    claim_value, claim_unit, claim_kind = claimed
+    ev_value, ev_unit, ev_kind = evidence
+    if claim_unit != ev_unit:
+        if {claim_unit, ev_unit} == {"temperature_c", "temperature_f"}:
+            if claim_unit == "temperature_f":
+                claim_value = (claim_value - 32.0) * 5.0 / 9.0
+                claim_unit = "temperature_c"
+            if ev_unit == "temperature_f":
+                ev_value = (ev_value - 32.0) * 5.0 / 9.0
+                ev_unit = "temperature_c"
+        else:
+            return None
+    if claim_unit != ev_unit:
+        return None
+
+    tol_key = claim_kind.value if claim_kind != NumericUnit.NONE else "none"
+    tol = NUMERIC_TOLERANCES.get(tol_key, NUMERIC_TOLERANCES["none"])
+    rel_err = abs(ev_value - claim_value) / max(abs(claim_value), 1.0)
+    abs_err = abs(ev_value - claim_value)
+
+    if rel_err == 0.0:
+        return ComparisonResult.MATCHES
+    if (tol["relative"] > 0 and rel_err <= tol["relative"]) or (tol["absolute"] > 0 and abs_err <= tol["absolute"]):
+        return ComparisonResult.CLOSE
+    if rel_err <= max(tol["relative"] * 3, 0.12) or (tol["absolute"] > 0 and abs_err <= tol["absolute"] * 3):
+        return ComparisonResult.DIVERGES
+    return ComparisonResult.CONTRADICTS
+
+
+def _compare_numeric_texts(claim_text: str, evidence_text: str) -> ComparisonResult:
+    claim_quantities = _extract_quantities(claim_text)
+    evidence_quantities = _extract_quantities(evidence_text)
+    if not claim_quantities or not evidence_quantities:
+        return ComparisonResult.NOT_FOUND
+
+    priority = [
+        ComparisonResult.MATCHES,
+        ComparisonResult.CLOSE,
+        ComparisonResult.DIVERGES,
+        ComparisonResult.CONTRADICTS,
+    ]
+    best: ComparisonResult | None = None
+    for claimed in claim_quantities:
+        for evidence in evidence_quantities:
+            candidate = _evaluate_numeric_pair(claimed, evidence)
+            if candidate is None:
+                continue
+            if best is None or priority.index(candidate) < priority.index(best):
+                best = candidate
+    return best or ComparisonResult.NOT_FOUND
 
 
 def _heuristic_nli(
