@@ -191,6 +191,28 @@ _SCIENCE_DOMAIN_TERMS: dict[str, frozenset[str]] = {
     }),
 }
 
+_POLITICAL_ROLE_TERMS: frozenset[str] = frozenset({
+    "king", "queen", "president", "prime minister", "pm", "emperor",
+    "monarch", "governor", "mayor", "senator", "ruler",
+})
+
+_CELESTIAL_BODIES: frozenset[str] = frozenset({
+    "mars", "jupiter", "saturn", "venus", "mercury", "neptune", "uranus",
+    "pluto", "moon", "the moon",
+})
+
+_FICTIONAL_REAL_CONTEXTS: frozenset[str] = frozenset({
+    "hogwarts", "middle earth", "middle-earth", "narnia", "westeros",
+})
+
+_MODERN_TECH_TERMS: frozenset[str] = frozenset({
+    "internet", "smartphone", "wifi", "web browser", "social media",
+})
+
+_HISTORICAL_FIGURES: frozenset[str] = frozenset({
+    "einstein", "isaac newton", "newton", "galileo", "leonardo da vinci",
+})
+
 _UNIT_ALIASES: dict[str, tuple[str, float, NumericUnit]] = {
     "%": ("percent", 1.0, NumericUnit.PERCENT),
     "percent": ("percent", 1.0, NumericUnit.PERCENT),
@@ -900,7 +922,7 @@ class ClaimExtractionAgent:
 
     def is_verifiable(self, text: str) -> bool:
         """Rule-based classifier to reject questions, opinions, and conversational text."""
-        text = text.strip()
+        text = _strip_emojis(text).strip()
         if not text or len(text.split()) < 3: return False
         if text.endswith('?'): return False
         
@@ -908,9 +930,12 @@ class ClaimExtractionAgent:
         unverifiable_prefixes = [
             "i think", "i believe", "in my opinion", "hello", "hi", "how can i",
             "here are", "below is", "let me", "sure", "of course", "personally",
-            "arguably", "some might say", "yes", "it might", "it may", "it could"
+            "arguably", "some might say", "yes", "it might", "it may", "it could",
+            "let me know if", "hope this helps", "feel free to ask", "thanks",
         ]
         if any(lower_text.startswith(p) for p in unverifiable_prefixes):
+            return False
+        if _looks_meta_or_conversational(lower_text):
             return False
             
         return True
@@ -921,7 +946,7 @@ class ClaimExtractionAgent:
         parts = pat.split(text.strip())
         claims: list[RawClaim] = []
         for idx, part in enumerate(parts):
-            part = part.strip()
+            part = _strip_emojis(part).strip()
             if not part: continue
             is_v = self.is_verifiable(part)
             claims.append(RawClaim(text=part, sentence_index=idx, is_verifiable=is_v))
@@ -1895,6 +1920,15 @@ class ClaimScoreInput:
     domain: str = "general"
 
 
+@dataclass(frozen=True)
+class EntityExistenceAssessment:
+    target_entity: str = ""
+    status: str = "unknown"   # non_existent | existent | unknown
+    claim_polarity: str = "neutral"  # negative | positive | neutral
+    reason: str = ""
+    impossible: bool = False
+
+
 class ScoringCalibrator:
     """Single source of truth for scoring + labeling.
 
@@ -2335,6 +2369,7 @@ class VerificationOrchestrator:
                 )
                 rel_verified = any(s.relation_match_score > 0.4 for s in top_evidence)
                 domain = _detect_claim_domain(claim.contextualized_text)
+                existence = _assess_entity_existence(claim, retrieval, top_evidence)
 
                 try:
                     score_input = ClaimScoreInput(
@@ -2350,7 +2385,13 @@ class VerificationOrchestrator:
                         domain=domain,
                     )
                     score = self._calibrator.compute_claim_score(score_input)
-                    label = _claim_label_from_score_and_evidence(score, top_evidence, has_relevant_evidence)
+                    score, label = _apply_existence_override(
+                        score=score,
+                        default_label=_claim_label_from_score_and_evidence(score, top_evidence, has_relevant_evidence),
+                        existence=existence,
+                        has_relevant_evidence=has_relevant_evidence,
+                        claim_type=analysis.claim_type if analysis else ClaimType.GENERAL,
+                    )
                     explanation = self._explainer.generate(
                         claim, top_evidence, score, label, numeric_result
                     )
@@ -2577,6 +2618,149 @@ def _detect_claim_domain(text: str) -> str:
     return best_domain
 
 
+def _detect_claim_polarity(text: str) -> str:
+    lower = (text or "").lower()
+    negative_patterns = (
+        r"\bthere is no\b",
+        r"\bthere are no\b",
+        r"\bdoes not exist\b",
+        r"\bdo not exist\b",
+        r"\bno such\b",
+        r"\bnever existed\b",
+        r"\bhas no\b",
+    )
+    if any(re.search(pattern, lower) for pattern in negative_patterns):
+        return "negative"
+    positive_patterns = (
+        r"\bthere is a\b",
+        r"\bthere is an\b",
+        r"\bthere are\b",
+        r"\bexists\b",
+        r"\bis real\b",
+    )
+    if any(re.search(pattern, lower) for pattern in positive_patterns):
+        return "positive"
+    return "neutral"
+
+
+def _extract_target_entity(text: str, triple: RelationalTriple | None = None) -> str:
+    lower = (text or "").strip()
+    patterns = (
+        r"\bthere is no\s+(.+?)(?:[.!?]|$)",
+        r"\bthere are no\s+(.+?)(?:[.!?]|$)",
+        r"\bthere is a[n]?\s+(.+?)(?:[.!?]|$)",
+        r"\b([a-z0-9\s'\-]+?)\s+does not exist\b",
+        r"\b([a-z0-9\s'\-]+?)\s+never existed\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, lower, flags=re.IGNORECASE)
+        if match:
+            candidate = re.sub(r"\s+", " ", match.group(1)).strip(" .,!?:;")
+            if candidate:
+                return candidate
+    if triple:
+        if triple.object and triple.subject:
+            return f"{triple.predicate or ''} {triple.object} of {triple.subject}".strip()
+        if triple.object:
+            return triple.object
+        if triple.subject:
+            return triple.subject
+    return lower
+
+
+def _is_impossible_entity(target_entity: str, claim_text: str) -> tuple[bool, str]:
+    target = re.sub(r"\s+", " ", (target_entity or "").lower()).strip()
+    claim_lower = (claim_text or "").lower()
+    for body in _CELESTIAL_BODIES:
+        if f"of {body}" in target and any(role in target for role in _POLITICAL_ROLE_TERMS):
+            return True, "political role assigned to a celestial body"
+    for fictional in _FICTIONAL_REAL_CONTEXTS:
+        if fictional in target and any(role in target for role in _POLITICAL_ROLE_TERMS | frozenset({"ceo", "founder", "chairman"})):
+            return True, "fictional setting used as a real-world institution"
+    if any(figure in claim_lower for figure in _HISTORICAL_FIGURES) and any(term in claim_lower for term in _MODERN_TECH_TERMS):
+        if re.search(r"\b(invented|created|developed|built)\b", claim_lower):
+            return True, "anachronistic creator-tech pairing"
+    return False, ""
+
+
+def _credible_negative_evidence(target_entity: str, snippets: list[EvidenceSnippet]) -> bool:
+    target_tokens = set(_content_tokens(target_entity))
+    for snippet in snippets:
+        if snippet.credibility_tier != CredibilityTier.TIER_1:
+            continue
+        text = (snippet.snippet or "").lower()
+        if target_tokens and not (target_tokens & set(_content_tokens(text))):
+            continue
+        if any(phrase in text for phrase in ("does not exist", "there is no", "never existed", "fictional")):
+            return True
+    return False
+
+
+def _assess_entity_existence(
+    claim: ResolvedClaim,
+    retrieval: RetrievalResult,
+    snippets: list[EvidenceSnippet],
+) -> EntityExistenceAssessment:
+    text = claim.contextualized_text
+    triple = claim.analysis.triple if claim.analysis else None
+    polarity = _detect_claim_polarity(text)
+    target = _extract_target_entity(text, triple)
+    impossible, reason = _is_impossible_entity(target, text)
+    if impossible:
+        return EntityExistenceAssessment(
+            target_entity=target,
+            status="non_existent",
+            claim_polarity=polarity,
+            reason=reason,
+            impossible=True,
+        )
+    if _credible_negative_evidence(target, snippets):
+        return EntityExistenceAssessment(
+            target_entity=target,
+            status="non_existent",
+            claim_polarity=polarity,
+            reason="credible evidence indicates non-existence",
+            impossible=False,
+        )
+    if retrieval.retrieval_success and snippets:
+        return EntityExistenceAssessment(
+            target_entity=target,
+            status="existent",
+            claim_polarity=polarity,
+            reason="entity context retrieved",
+            impossible=False,
+        )
+    return EntityExistenceAssessment(
+        target_entity=target,
+        status="unknown",
+        claim_polarity=polarity,
+        reason="retrieval did not establish existence",
+        impossible=False,
+    )
+
+
+def _apply_existence_override(
+    score: float,
+    default_label: VerificationLabel,
+    existence: EntityExistenceAssessment,
+    has_relevant_evidence: bool,
+    claim_type: ClaimType,
+) -> tuple[float, VerificationLabel]:
+    if existence.status == "non_existent":
+        if existence.claim_polarity == "negative":
+            return max(score, 0.95), VerificationLabel.VERIFIED
+        if existence.claim_polarity == "positive":
+            return 0.0, VerificationLabel.CONTRADICTED
+    if (
+        existence.status == "unknown"
+        and existence.claim_polarity in {"negative", "positive"}
+        and claim_type in {ClaimType.EXISTENCE, ClaimType.GENERAL}
+        and not has_relevant_evidence
+    ):
+        return 0.5, VerificationLabel.UNCERTAIN
+    return score, default_label
+
+
 def _passes_evidence_quality_filter(
     text: str,
     subject: str,
@@ -2708,6 +2892,19 @@ def _mode_scoring_note(mode: VerificationMode) -> str:
     if mode == VerificationMode.EXPLANATION:
         return "This response contains simplified explanations; scoring adjusted accordingly."
     return "Strict factual verification mode applied."
+
+
+def _strip_emojis(text: str) -> str:
+    return re.sub(r"[\U00010000-\U0010ffff]", "", text or "")
+
+
+def _looks_meta_or_conversational(text: str) -> bool:
+    lower = (text or "").lower().strip()
+    meta_markers = (
+        "let me know if", "hope this helps", "feel free to ask",
+        "thanks for asking", "i can help", "happy to help",
+    )
+    return any(marker in lower for marker in meta_markers)
 
 
 def _is_analogy_or_stylistic(text: str) -> bool:

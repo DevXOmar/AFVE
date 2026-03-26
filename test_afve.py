@@ -477,6 +477,14 @@ class TestClaimExtraction:
         assert len(verifiable) == 1
         assert "1991" in verifiable[0].text
 
+    def test_meta_and_emoji_text_filtered(self):
+        agent = self._agent()
+        text = "Hope this helps! 😊 Let me know if you want more. Python was released in 1991."
+        raw = agent._split_into_sentences(text)
+        verifiable = [r for r in raw if r.is_verifiable]
+        assert len(verifiable) == 1
+        assert verifiable[0].text == "Python was released in 1991."
+
     # --- extract() integration (no LLM, no coreference) ---
 
     @pytest.mark.asyncio
@@ -792,6 +800,85 @@ class TestVerificationUtilities:
             "The speed of light is approximately 3 x 10^8 m/s in vacuum.",
         )
         assert result in {ComparisonResult.MATCHES, ComparisonResult.CLOSE}
+
+    def test_impossible_entity_assessment_detects_king_of_mars(self):
+        from agents import _assess_entity_existence
+        from models import RetrievalResult, ResolvedClaim
+
+        claim = ResolvedClaim(
+            original_text="There is no king of Mars.",
+            contextualized_text="There is no king of Mars.",
+            sentence_index=0,
+        )
+        retrieval = RetrievalResult(
+            claim=claim,
+            snippets=[],
+            queries_attempted=1,
+            retrieval_success=False,
+        )
+        assessment = _assess_entity_existence(claim, retrieval, [])
+        assert assessment.status == "non_existent"
+        assert assessment.claim_polarity == "negative"
+
+    def test_existence_override_verifies_negative_nonexistent_entity(self):
+        from agents import EntityExistenceAssessment, _apply_existence_override
+        from models import ClaimType, VerificationLabel
+
+        score, label = _apply_existence_override(
+            score=0.5,
+            default_label=VerificationLabel.UNCERTAIN,
+            existence=EntityExistenceAssessment(
+                target_entity="king of mars",
+                status="non_existent",
+                claim_polarity="negative",
+                reason="political role assigned to a celestial body",
+                impossible=True,
+            ),
+            has_relevant_evidence=False,
+            claim_type=ClaimType.GENERAL,
+        )
+        assert score >= 0.95
+        assert label == VerificationLabel.VERIFIED
+
+    def test_existence_override_contradicts_positive_nonexistent_entity(self):
+        from agents import EntityExistenceAssessment, _apply_existence_override
+        from models import ClaimType, VerificationLabel
+
+        score, label = _apply_existence_override(
+            score=0.5,
+            default_label=VerificationLabel.UNCERTAIN,
+            existence=EntityExistenceAssessment(
+                target_entity="king of mars",
+                status="non_existent",
+                claim_polarity="positive",
+                reason="political role assigned to a celestial body",
+                impossible=True,
+            ),
+            has_relevant_evidence=False,
+            claim_type=ClaimType.EXISTENCE,
+        )
+        assert score == 0.0
+        assert label == VerificationLabel.CONTRADICTED
+
+    def test_existence_override_keeps_weak_retrieval_uncertain(self):
+        from agents import EntityExistenceAssessment, _apply_existence_override
+        from models import ClaimType, VerificationLabel
+
+        score, label = _apply_existence_override(
+            score=0.2,
+            default_label=VerificationLabel.UNSUPPORTED,
+            existence=EntityExistenceAssessment(
+                target_entity="inventor of penicillin",
+                status="unknown",
+                claim_polarity="positive",
+                reason="retrieval did not establish existence",
+                impossible=False,
+            ),
+            has_relevant_evidence=False,
+            claim_type=ClaimType.EXISTENCE,
+        )
+        assert score == 0.5
+        assert label == VerificationLabel.UNCERTAIN
 
 
 # ===========================================================================
@@ -1218,12 +1305,16 @@ class TestOrchestrator:
 
         return VerificationOrchestrator(extractor, retriever, verifier, calibrator, explainer)
 
-    def _request(self, model_output: str = "Python was created by Guido van Rossum in 1991."):
+    def _request(
+        self,
+        model_output: str = "Python was created by Guido van Rossum in 1991.",
+        prompt: str = "Tell me about Python.",
+    ):
         from models import VerificationRequest, VerificationConfig
 
         return VerificationRequest(
             job_id=uuid.uuid4(),
-            prompt="Tell me about Python.",
+            prompt=prompt,
             model_output=model_output,
             config=VerificationConfig(
                 enable_llm_judge=False,
@@ -1282,6 +1373,86 @@ class TestOrchestrator:
         report = await orchestrator.run(req)
         assert report.claims == []
         assert report.overall_score is None
+
+    @pytest.mark.asyncio
+    async def test_negative_impossible_entity_claim_is_verified(self):
+        from models import EntailmentStatus
+
+        snippets = [
+            make_snippet(
+                url="https://en.wikipedia.org/wiki/Mars",
+                text="Mars is the fourth planet from the Sun.",
+            )
+        ]
+
+        async def mock_retrieve(claim, config):
+            return make_retrieval_result(claim=claim, snippets=snippets, success=True)
+
+        async def mock_verify(retrieval, config):
+            for s in retrieval.snippets:
+                if "planet" in retrieval.claim.contextualized_text.lower():
+                    s.entailment_status = EntailmentStatus.SUPPORTS
+                    s.nli_score = 0.9
+                else:
+                    s.entailment_status = EntailmentStatus.NEUTRAL
+                    s.nli_score = 0.5
+            if "planet" in retrieval.claim.contextualized_text.lower():
+                return 0.9, 0.0, 0.9, 0.9, retrieval.snippets
+            return 0.5, 0.0, 0.5, 0.5, retrieval.snippets
+
+        from agents import ClaimExtractionAgent, ScoringCalibrator, ExplanationGenerator, VerificationOrchestrator
+
+        orchestrator = VerificationOrchestrator(
+            ClaimExtractionAgent(llm_client=None),
+            MagicMock(retrieve=AsyncMock(side_effect=mock_retrieve)),
+            MagicMock(verify=AsyncMock(side_effect=mock_verify)),
+            ScoringCalibrator(),
+            ExplanationGenerator(),
+        )
+        report = await orchestrator.run(self._request(
+            "There is no king of Mars. Mars is a planet.",
+            prompt="Who is the king of Mars?",
+        ))
+        assert report.overall_score >= 0.9
+        mars_claim = next(c for c in report.claims if "king of Mars" in c.contextualized_claim or "king of Mars" in c.claim)
+        assert mars_claim.label.value == "VERIFIED"
+        assert mars_claim.score >= 0.9
+
+    @pytest.mark.asyncio
+    async def test_positive_impossible_entity_claim_is_contradicted(self):
+        from models import EntailmentStatus
+
+        snippets = [
+            make_snippet(
+                url="https://en.wikipedia.org/wiki/Mars",
+                text="Mars is a planet and has no monarch.",
+            )
+        ]
+
+        async def mock_retrieve(claim, config):
+            return make_retrieval_result(claim=claim, snippets=snippets, success=True)
+
+        async def mock_verify(retrieval, config):
+            for s in retrieval.snippets:
+                s.entailment_status = EntailmentStatus.NEUTRAL
+                s.nli_score = 0.5
+            return 0.5, 0.0, 0.5, 0.5, retrieval.snippets
+
+        from agents import ClaimExtractionAgent, ScoringCalibrator, ExplanationGenerator, VerificationOrchestrator
+
+        orchestrator = VerificationOrchestrator(
+            ClaimExtractionAgent(llm_client=None),
+            MagicMock(retrieve=AsyncMock(side_effect=mock_retrieve)),
+            MagicMock(verify=AsyncMock(side_effect=mock_verify)),
+            ScoringCalibrator(),
+            ExplanationGenerator(),
+        )
+        report = await orchestrator.run(self._request(
+            "There is a king of Mars.",
+            prompt="Is there a king of Mars?",
+        ))
+        assert report.claims[0].label.value == "CONTRADICTED"
+        assert report.claims[0].score == 0.0
 
     @pytest.mark.asyncio
     async def test_failed_claim_verification_excluded_from_report(self):
