@@ -405,6 +405,9 @@ class VerifiedClaim(BaseModel):
     entities: list[EntitySpan] = Field(default_factory=list)
     numeric_assertions: list[NumericAssertion] = Field(default_factory=list)
     numeric_comparison: ComparisonResult = ComparisonResult.NOT_FOUND
+    claim_year: int | None = None
+    reference_year: int | None = None
+    validation_errors: list[str] = Field(default_factory=list)
     top_supporting_evidence: list[EvidenceSnippet] = Field(default_factory=list)
     top_contradicting_evidence: list[EvidenceSnippet] = Field(default_factory=list)
     relevance_score: Annotated[float, Field(ge=0.0, le=1.0)] = 0.0

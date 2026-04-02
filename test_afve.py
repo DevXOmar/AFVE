@@ -801,6 +801,70 @@ class TestVerificationUtilities:
         )
         assert result in {ComparisonResult.MATCHES, ComparisonResult.CLOSE}
 
+    def test_strict_unit_validation_flags_wrong_speed_unit(self):
+        from agents import _validate_unit_consistency
+
+        errors = _validate_unit_consistency(
+            "The speed of light is 670,616,629 miles per second.",
+            [
+                make_snippet(
+                    text="The speed of light in vacuum is 186,282 miles per second.",
+                    url="https://en.wikipedia.org/wiki/Speed_of_light",
+                )
+            ],
+        )
+        assert errors
+        assert "UNIT ERROR" in errors[0]
+        assert "miles per hour" in errors[0]
+
+    def test_strict_unit_validation_allows_valid_converted_speed(self):
+        from agents import _validate_unit_consistency
+
+        errors = _validate_unit_consistency(
+            "The speed of light is 186,282 miles per second.",
+            [
+                make_snippet(
+                    text="The speed of light in vacuum is 299,792 kilometers per second.",
+                    url="https://en.wikipedia.org/wiki/Speed_of_light",
+                )
+            ],
+        )
+        assert errors == []
+
+    def test_cross_claim_temporal_validation_caps_scores(self):
+        from agents import _apply_cross_claim_temporal_validation
+        from models import VerificationLabel, VerifiedClaim
+
+        claims = [
+            VerifiedClaim(
+                claim="Titanic won Best Picture in 1998.",
+                contextualized_claim="Titanic won Best Picture in 1998.",
+                score=1.0,
+                label=VerificationLabel.VERIFIED,
+                explanation="Verified by evidence.",
+                evidence=[],
+                claim_year=1998,
+            ),
+            VerifiedClaim(
+                claim="Halle Berry won Best Actress in 2002.",
+                contextualized_claim="Halle Berry won Best Actress in 2002.",
+                score=1.0,
+                label=VerificationLabel.VERIFIED,
+                explanation="Verified by evidence.",
+                evidence=[],
+                claim_year=2002,
+            ),
+        ]
+
+        _apply_cross_claim_temporal_validation(
+            claims,
+            "Which film won Best Picture and which actress won Best Actress in the same year?",
+        )
+
+        assert all(claim.label == VerificationLabel.CONTRADICTED for claim in claims)
+        assert all(claim.score <= 0.3 for claim in claims)
+        assert all("TEMPORAL ERROR" in claim.explanation for claim in claims)
+
     def test_impossible_entity_assessment_detects_king_of_mars(self):
         from agents import _assess_entity_existence
         from models import RetrievalResult, ResolvedClaim
@@ -1453,6 +1517,54 @@ class TestOrchestrator:
         ))
         assert report.claims[0].label.value == "CONTRADICTED"
         assert report.claims[0].score == 0.0
+
+    @pytest.mark.asyncio
+    async def test_same_year_prompt_mismatch_forces_contradiction(self):
+        from models import EntailmentStatus
+        from agents import ClaimExtractionAgent, ScoringCalibrator, ExplanationGenerator, VerificationOrchestrator
+
+        async def mock_retrieve(claim, config):
+            text = claim.contextualized_text.lower()
+            if "titanic" in text:
+                snippets = [
+                    make_snippet(
+                        url="https://example.com/titanic",
+                        text="Titanic won the Academy Award for Best Picture at the 1998 ceremony.",
+                    )
+                ]
+            else:
+                snippets = [
+                    make_snippet(
+                        url="https://example.com/halle-berry",
+                        text="Halle Berry won the Academy Award for Best Actress in 2002.",
+                    )
+                ]
+            return make_retrieval_result(claim=claim, snippets=snippets, success=True)
+
+        async def mock_verify(retrieval, config):
+            for s in retrieval.snippets:
+                s.entailment_status = EntailmentStatus.SUPPORTS
+                s.nli_score = 0.95
+                s.llm_judge_score = 0.0
+            return 0.95, 0.0, 0.9, 0.9, retrieval.snippets
+
+        orchestrator = VerificationOrchestrator(
+            ClaimExtractionAgent(llm_client=None),
+            MagicMock(retrieve=AsyncMock(side_effect=mock_retrieve)),
+            MagicMock(verify=AsyncMock(side_effect=mock_verify)),
+            ScoringCalibrator(),
+            ExplanationGenerator(),
+        )
+
+        report = await orchestrator.run(self._request(
+            "Titanic won Best Picture in 1998. Halle Berry won Best Actress in 2002.",
+            prompt="Which film won Best Picture and which actress won Best Actress in the same year?",
+        ))
+
+        assert report.overall_score <= 0.3
+        assert len(report.claims) >= 2
+        assert all(claim.label.value == "CONTRADICTED" for claim in report.claims[:2])
+        assert all("TEMPORAL ERROR" in claim.explanation for claim in report.claims[:2])
 
     @pytest.mark.asyncio
     async def test_failed_claim_verification_excluded_from_report(self):

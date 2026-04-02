@@ -60,7 +60,7 @@ import re
 import threading
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 import httpx
@@ -255,6 +255,31 @@ _UNIT_ALIASES: dict[str, tuple[str, float, NumericUnit]] = {
     "f": ("temperature_f", 1.0, NumericUnit.NONE),
     "°f": ("temperature_f", 1.0, NumericUnit.NONE),
 }
+
+_STRICT_UNIT_TOLERANCE = 0.05
+_STRICT_UNIT_EXTRACT_RE = re.compile(
+    r"(?P<value>[+-]?\d[\d,]*(?:\.\d+)?(?:\s*(?:x|e)\s*10\^?\s*[+-]?\d+)?)"
+    r"\s*(?P<unit>"
+    r"miles per second|mile per second|miles/second|mile/second|mi/s|"
+    r"miles per hour|mile per hour|miles/hour|mile/hour|mph|"
+    r"meters per second|metres per second|meter per second|metre per second|meters/second|metres/second|m/s|mps|"
+    r"kilometers per second|kilometres per second|kilometer per second|kilometre per second|kilometers/second|kilometres/second|km/s|"
+    r"kelvin|k|degrees celsius|degree celsius|celsius|°c|c|degrees fahrenheit|degree fahrenheit|fahrenheit|°f|f|"
+    r"kilometers|kilometres|kilometer|kilometre|km|meters|metres|meter|metre|miles|mile|mi|m|"
+    r"kilograms|kilogram|kg|grams|gram|g|pounds|pound|lbs|lb)"
+    r"\b",
+    flags=re.IGNORECASE,
+)
+_TEMPORAL_EQUALITY_PATTERNS: tuple[str, ...] = (
+    r"\bsame year\b",
+    r"\bin the same year\b",
+    r"\bthat same year\b",
+    r"\bduring the same year\b",
+    r"\bwhen\b.+\bhappened\b",
+    r"\bduring\b",
+)
+_TEMPORAL_BEFORE_PATTERNS: tuple[str, ...] = (r"\bbefore\b",)
+_TEMPORAL_AFTER_PATTERNS: tuple[str, ...] = (r"\bafter\b",)
 
 # ---------------------------------------------------------------------------
 # Lazy model loaders
@@ -1929,6 +1954,32 @@ class EntityExistenceAssessment:
     impossible: bool = False
 
 
+@dataclass(frozen=True)
+class QuantityMention:
+    value: float
+    raw_unit: str
+    family: str
+    canonical_value: float
+    canonical_unit: str
+
+
+@dataclass(frozen=True)
+class TemporalRequirement:
+    relation: str = "none"   # none | equal | before | after
+    prompt_years: tuple[int, ...] = ()
+
+
+@dataclass
+class ValidationOutcome:
+    errors: list[str] = field(default_factory=list)
+    claim_year: int | None = None
+    reference_year: int | None = None
+
+    @property
+    def failed(self) -> bool:
+        return bool(self.errors)
+
+
 class ScoringCalibrator:
     """Single source of truth for scoring + labeling.
 
@@ -2047,6 +2098,7 @@ class ExplanationGenerator:
         score: float,
         label: VerificationLabel,
         numeric_result: ComparisonResult = ComparisonResult.NOT_FOUND,
+        validation_errors: list[str] | None = None,
     ) -> str:
         analysis = claim.analysis
         if analysis:
@@ -2080,6 +2132,8 @@ class ExplanationGenerator:
         }
         if numeric_result in num_msg:
             parts.append(num_msg[numeric_result])
+        if validation_errors:
+            parts.extend(validation_errors)
 
         if label == VerificationLabel.VERIFIED:
             parts.append(
@@ -2256,7 +2310,7 @@ class VerificationOrchestrator:
                 scoring_note=_mode_scoring_note(mode),
             )
 
-        tasks   = [self._verify_claim(c, request.config) for c in claims]
+        tasks   = [self._verify_claim(c, request.config, request.prompt) for c in claims]
         results = await asyncio.gather(*tasks)
         valid   = [v for v in results if v is not None]
 
@@ -2283,6 +2337,7 @@ class VerificationOrchestrator:
                 scoring_note=_mode_scoring_note(mode),
             )
 
+        _apply_cross_claim_temporal_validation(valid, request.prompt)
         overall_score = self._calibrator.compute_overall_score(valid)
         overall_label = self._calibrator.score_to_label(overall_score)
         elapsed_ms    = int((time.monotonic() - start) * 1000)
@@ -2344,7 +2399,7 @@ class VerificationOrchestrator:
         )
 
     async def _verify_claim(
-        self, claim: ResolvedClaim, config
+        self, claim: ResolvedClaim, config, prompt: str
     ) -> VerifiedClaim | None:
         async with self._semaphore:
             try:
@@ -2370,6 +2425,8 @@ class VerificationOrchestrator:
                 rel_verified = any(s.relation_match_score > 0.4 for s in top_evidence)
                 domain = _detect_claim_domain(claim.contextualized_text)
                 existence = _assess_entity_existence(claim, retrieval, top_evidence)
+                temporal_validation = ValidationOutcome()
+                validation_errors: list[str] = []
 
                 try:
                     score_input = ClaimScoreInput(
@@ -2392,8 +2449,24 @@ class VerificationOrchestrator:
                         has_relevant_evidence=has_relevant_evidence,
                         claim_type=analysis.claim_type if analysis else ClaimType.GENERAL,
                     )
+                    requirement = _infer_temporal_requirement(prompt)
+                    temporal_validation = _validate_temporal_consistency(
+                        claim.contextualized_text,
+                        top_evidence,
+                        requirement,
+                    )
+                    validation_errors = _validate_unit_consistency(
+                        claim.contextualized_text,
+                        top_evidence,
+                    ) + temporal_validation.errors
+                    score, label = _apply_validation_override(score, label, validation_errors)
                     explanation = self._explainer.generate(
-                        claim, top_evidence, score, label, numeric_result
+                        claim,
+                        top_evidence,
+                        score,
+                        label,
+                        numeric_result,
+                        validation_errors=validation_errors,
                     )
                 except Exception as exc:
                     logger.warning("Scoring/label/explain failed: %s", exc)
@@ -2427,6 +2500,9 @@ class VerificationOrchestrator:
                     entities=entities,
                     numeric_assertions=analysis.numeric_assertions if analysis else [],
                     numeric_comparison=numeric_result,
+                    claim_year=temporal_validation.claim_year,
+                    reference_year=temporal_validation.reference_year,
+                    validation_errors=validation_errors,
                     top_supporting_evidence=supporting,
                     top_contradicting_evidence=contradicting,
                     relevance_score=getattr(claim, "relevance_score", 0.0),
@@ -2759,6 +2835,305 @@ def _apply_existence_override(
     ):
         return 0.5, VerificationLabel.UNCERTAIN
     return score, default_label
+
+
+def _extract_years(text: str) -> list[int]:
+    years = []
+    for match in re.finditer(r"\b(1[0-9]{3}|20[0-9]{2})\b", text or ""):
+        years.append(int(match.group(1)))
+    return years
+
+
+def _infer_temporal_requirement(prompt: str) -> TemporalRequirement:
+    lower = (prompt or "").lower()
+    years = tuple(_extract_years(prompt))
+    if any(re.search(pattern, lower) for pattern in _TEMPORAL_BEFORE_PATTERNS):
+        return TemporalRequirement(relation="before", prompt_years=years)
+    if any(re.search(pattern, lower) for pattern in _TEMPORAL_AFTER_PATTERNS):
+        return TemporalRequirement(relation="after", prompt_years=years)
+    if any(re.search(pattern, lower) for pattern in _TEMPORAL_EQUALITY_PATTERNS):
+        return TemporalRequirement(relation="equal", prompt_years=years)
+    if len(years) == 1:
+        return TemporalRequirement(relation="equal", prompt_years=years)
+    return TemporalRequirement()
+
+
+def normalize_units(value: float, unit: str) -> tuple[float, str, str] | None:
+    normalized = re.sub(r"\s+", " ", (unit or "").strip().lower())
+    conversions: dict[str, tuple[str, str, float | None]] = {
+        "miles per second": ("speed", "m/s", 1609.34),
+        "mile per second": ("speed", "m/s", 1609.34),
+        "miles/second": ("speed", "m/s", 1609.34),
+        "mile/second": ("speed", "m/s", 1609.34),
+        "mi/s": ("speed", "m/s", 1609.34),
+        "miles per hour": ("speed", "m/s", 0.44704),
+        "mile per hour": ("speed", "m/s", 0.44704),
+        "miles/hour": ("speed", "m/s", 0.44704),
+        "mile/hour": ("speed", "m/s", 0.44704),
+        "mph": ("speed", "m/s", 0.44704),
+        "meters per second": ("speed", "m/s", 1.0),
+        "metres per second": ("speed", "m/s", 1.0),
+        "meter per second": ("speed", "m/s", 1.0),
+        "metre per second": ("speed", "m/s", 1.0),
+        "meters/second": ("speed", "m/s", 1.0),
+        "metres/second": ("speed", "m/s", 1.0),
+        "m/s": ("speed", "m/s", 1.0),
+        "mps": ("speed", "m/s", 1.0),
+        "kilometers per second": ("speed", "m/s", 1000.0),
+        "kilometres per second": ("speed", "m/s", 1000.0),
+        "kilometer per second": ("speed", "m/s", 1000.0),
+        "kilometre per second": ("speed", "m/s", 1000.0),
+        "kilometers/second": ("speed", "m/s", 1000.0),
+        "kilometres/second": ("speed", "m/s", 1000.0),
+        "km/s": ("speed", "m/s", 1000.0),
+        "degrees celsius": ("temperature", "c", None),
+        "degree celsius": ("temperature", "c", None),
+        "celsius": ("temperature", "c", None),
+        "°c": ("temperature", "c", None),
+        "c": ("temperature", "c", None),
+        "degrees fahrenheit": ("temperature", "c", None),
+        "degree fahrenheit": ("temperature", "c", None),
+        "fahrenheit": ("temperature", "c", None),
+        "°f": ("temperature", "c", None),
+        "f": ("temperature", "c", None),
+        "kelvin": ("temperature", "c", None),
+        "k": ("temperature", "c", None),
+        "kilometers": ("distance", "m", 1000.0),
+        "kilometres": ("distance", "m", 1000.0),
+        "kilometer": ("distance", "m", 1000.0),
+        "kilometre": ("distance", "m", 1000.0),
+        "km": ("distance", "m", 1000.0),
+        "meters": ("distance", "m", 1.0),
+        "metres": ("distance", "m", 1.0),
+        "meter": ("distance", "m", 1.0),
+        "metre": ("distance", "m", 1.0),
+        "m": ("distance", "m", 1.0),
+        "miles": ("distance", "m", 1609.34),
+        "mile": ("distance", "m", 1609.34),
+        "mi": ("distance", "m", 1609.34),
+        "kilograms": ("weight", "kg", 1.0),
+        "kilogram": ("weight", "kg", 1.0),
+        "kg": ("weight", "kg", 1.0),
+        "grams": ("weight", "kg", 0.001),
+        "gram": ("weight", "kg", 0.001),
+        "g": ("weight", "kg", 0.001),
+        "pounds": ("weight", "kg", 0.45359237),
+        "pound": ("weight", "kg", 0.45359237),
+        "lbs": ("weight", "kg", 0.45359237),
+        "lb": ("weight", "kg", 0.45359237),
+    }
+    if normalized not in conversions:
+        return None
+    family, canonical_unit, multiplier = conversions[normalized]
+    if family == "temperature":
+        if normalized in {"degrees fahrenheit", "degree fahrenheit", "fahrenheit", "°f", "f"}:
+            return ((value - 32.0) * 5.0 / 9.0, family, canonical_unit)
+        if normalized in {"kelvin", "k"}:
+            return (value - 273.15, family, canonical_unit)
+        return (value, family, canonical_unit)
+    assert multiplier is not None
+    return (value * multiplier, family, canonical_unit)
+
+
+def _extract_quantity_mentions(text: str) -> list[QuantityMention]:
+    mentions: list[QuantityMention] = []
+    for match in _STRICT_UNIT_EXTRACT_RE.finditer(_normalize_quantity_text(text)):
+        value = _parse_numeric_value(match.group("value"))
+        unit = (match.group("unit") or "").strip().lower()
+        if value is None or not unit:
+            continue
+        normalized = normalize_units(value, unit)
+        if normalized is None:
+            continue
+        canonical_value, family, canonical_unit = normalized
+        mentions.append(
+            QuantityMention(
+                value=value,
+                raw_unit=unit,
+                family=family,
+                canonical_value=canonical_value,
+                canonical_unit=canonical_unit,
+            )
+        )
+    return mentions
+
+
+def _within_tolerance(left: float, right: float, tolerance: float = _STRICT_UNIT_TOLERANCE) -> bool:
+    if left == right:
+        return True
+    return abs(left - right) / max(abs(left), abs(right), 1.0) <= tolerance
+
+
+def _format_unit_for_error(unit: str) -> str:
+    pretty = {
+        "mph": "miles per hour",
+        "m/s": "meters per second",
+        "mps": "meters per second",
+        "km/s": "kilometers per second",
+        "c": "degrees Celsius",
+        "f": "degrees Fahrenheit",
+        "k": "Kelvin",
+        "lb": "pounds",
+    }
+    normalized = unit.strip().lower()
+    if normalized in pretty:
+        return pretty[normalized]
+    return normalized.replace("/", " per ").replace("°", "degrees ").strip()
+
+
+def _infer_wrong_unit(
+    claim_value: float,
+    claim_unit: str,
+    evidence_value: float,
+    evidence_unit: str,
+) -> str | None:
+    claim_normalized = normalize_units(claim_value, claim_unit)
+    evidence_normalized = normalize_units(evidence_value, evidence_unit)
+    if claim_normalized is None or evidence_normalized is None:
+        return None
+    _, family, _ = claim_normalized
+    evidence_canonical, evidence_family, _ = evidence_normalized
+    if family != evidence_family:
+        return None
+
+    candidate_units = {
+        "speed": ("mph", "m/s", "km/s", "miles per second"),
+        "temperature": ("c", "f", "k"),
+        "distance": ("m", "km", "mi"),
+        "weight": ("kg", "g", "lb"),
+    }.get(family, ())
+
+    for alt_unit in candidate_units:
+        if alt_unit == claim_unit:
+            continue
+        alt_normalized = normalize_units(claim_value, alt_unit)
+        if alt_normalized is None:
+            continue
+        alt_value, alt_family, _ = alt_normalized
+        if alt_family == evidence_family and _within_tolerance(alt_value, evidence_canonical):
+            return alt_unit
+    return None
+
+
+def _validate_unit_consistency(claim_text: str, evidence: list[EvidenceSnippet]) -> list[str]:
+    claim_mentions = _extract_quantity_mentions(claim_text)
+    if not claim_mentions:
+        return []
+
+    errors: list[str] = []
+    for claim_mention in claim_mentions:
+        evidence_mentions: list[QuantityMention] = []
+        for snippet in evidence:
+            evidence_mentions.extend(
+                mention for mention in _extract_quantity_mentions(snippet.snippet)
+                if mention.family == claim_mention.family
+            )
+
+        if not evidence_mentions:
+            continue
+
+        if any(_within_tolerance(claim_mention.canonical_value, ev.canonical_value) for ev in evidence_mentions):
+            continue
+
+        best_match = min(
+            evidence_mentions,
+            key=lambda ev: abs(ev.canonical_value - claim_mention.canonical_value),
+        )
+        alt_unit = _infer_wrong_unit(
+            claim_mention.value,
+            claim_mention.raw_unit,
+            best_match.value,
+            best_match.raw_unit,
+        )
+        if alt_unit:
+            errors.append(
+                "UNIT ERROR: value corresponds to "
+                f"{_format_unit_for_error(alt_unit)}, not {_format_unit_for_error(claim_mention.raw_unit)}"
+            )
+        else:
+            errors.append(
+                "UNIT ERROR: "
+                f"{claim_mention.value:g} {_format_unit_for_error(claim_mention.raw_unit)} "
+                "does not match the referenced value within tolerance"
+            )
+        break
+
+    return errors
+
+
+def _validate_temporal_consistency(
+    claim_text: str,
+    evidence: list[EvidenceSnippet],
+    requirement: TemporalRequirement,
+) -> ValidationOutcome:
+    claim_years = _extract_years(claim_text)
+    claim_year = claim_years[0] if claim_years else None
+    evidence_years: list[int] = []
+    for snippet in evidence:
+        evidence_years.extend(_extract_years(snippet.snippet))
+    reference_year = evidence_years[0] if evidence_years else None
+    outcome = ValidationOutcome(claim_year=claim_year, reference_year=reference_year)
+
+    if requirement.prompt_years and claim_year is not None:
+        prompt_year = requirement.prompt_years[0]
+        outcome.reference_year = prompt_year
+        if requirement.relation == "equal" and claim_year != prompt_year:
+            outcome.errors.append(
+                f"TEMPORAL ERROR: expected year {prompt_year}, found {claim_year}"
+            )
+            return outcome
+
+    if (
+        requirement.relation == "equal"
+        and claim_year is not None
+        and reference_year is not None
+        and claim_year != reference_year
+    ):
+        outcome.errors.append(
+            f"TEMPORAL ERROR: claim year {claim_year} does not align with evidence year {reference_year}"
+        )
+    return outcome
+
+
+def _apply_validation_override(
+    score: float,
+    label: VerificationLabel,
+    errors: list[str],
+) -> tuple[float, VerificationLabel]:
+    if not errors:
+        return score, label
+    return min(score, 0.3), VerificationLabel.CONTRADICTED
+
+
+def _apply_cross_claim_temporal_validation(
+    claims: list[VerifiedClaim],
+    prompt: str,
+) -> None:
+    requirement = _infer_temporal_requirement(prompt)
+    if requirement.relation != "equal":
+        return
+
+    year_claims = [claim for claim in claims if claim.claim_year is not None]
+    if len(year_claims) < 2:
+        return
+
+    distinct_years = sorted({int(claim.claim_year) for claim in year_claims if claim.claim_year is not None})
+    if len(distinct_years) <= 1:
+        return
+
+    reference_year = distinct_years[0]
+    expected_year = requirement.prompt_years[0] if requirement.prompt_years else reference_year
+    for claim in year_claims:
+        claim.reference_year = expected_year
+        message = (
+            f"TEMPORAL ERROR: events occur in different years ({distinct_years[0]} vs {distinct_years[-1]})"
+        )
+        if message not in claim.validation_errors:
+            claim.validation_errors.append(message)
+        claim.score = min(claim.score, 0.3)
+        claim.label = VerificationLabel.CONTRADICTED
+        if message not in claim.explanation:
+            claim.explanation = f"{message} {claim.explanation}".strip()
 
 
 def _passes_evidence_quality_filter(
