@@ -568,6 +568,8 @@ def _variance(values: list[float]) -> float:
 def _score_to_rating(score_percent: float | None) -> str | None:
     if score_percent is None:
         return None
+    if score_percent <= 20.0:
+        return "Insufficient Evidence"
     if score_percent >= 85.0:
         return "Highly Reliable"
     if score_percent >= 70.0:

@@ -1884,6 +1884,44 @@ class TestEdgeCases:
         assert body["overall_score"] is None
         assert body["overall_label"] == "NO_VERIFIABLE_CONTENT"
 
+    def test_hedged_non_answer_produces_zero_claims(self, client):
+        payload = minimal_request(
+            "The exact population figure is not available from the information provided."
+        )
+        body = client.post("/verify", json=payload).json()
+        assert body["claims"] == []
+        assert body["overall_score"] is None
+        assert body["overall_label"] == "NO_VERIFIABLE_CONTENT"
+
+    @pytest.mark.asyncio
+    async def test_decomposer_does_not_use_while_as_subject(self):
+        from agents import RelationalDecomposer
+        from models import VerificationConfig
+
+        decomposer = RelationalDecomposer()
+        atoms = await decomposer.decompose(
+            "While lightning is hotter than the surface of the Sun.",
+            0,
+            VerificationConfig(),
+        )
+        assert atoms
+        assert atoms[0].analysis is not None
+        assert atoms[0].analysis.triple.subject.lower() != "while"
+
+    def test_dictionary_style_evidence_is_rejected(self):
+        from agents import _passes_evidence_quality_filter
+
+        assert not _passes_evidence_quality_filter(
+            "While is an English word used as a conjunction in a sentence.",
+            "While",
+            {"lightning", "sun", "temperature"},
+        )
+
+    def test_low_score_rating_is_insufficient_evidence(self):
+        from models import _score_to_rating
+
+        assert _score_to_rating(20.0) == "Insufficient Evidence"
+
     @pytest.mark.asyncio
     async def test_score_calibrator_precision(self):
         from agents import ScoringCalibrator

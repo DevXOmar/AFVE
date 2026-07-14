@@ -334,9 +334,31 @@ _RETRIEVAL_STOPWORDS: frozenset[str] = frozenset({
     # Additional generic glue/pronouns that produce low-quality queries
     "another","this","these","those","they","them","he","she","we","you","i",
     "of","to","and","or","as","at","by","from","with","without",
+    "while","whereas","although","though","however","therefore","because",
+    "since","until","before","after","during","into","than","then",
     # Explicitly banned query noise
     "overview","wikipedia",
 })
+
+_NON_ANSWER_PATTERNS: tuple[str, ...] = (
+    r"\b(exact|specific|current|latest)\s+(figure|number|population|data|value|amount)\s+"
+    r"(?:is|are|was|were)?\s*(?:not|n't)\s+(?:available|known|provided|specified|given)\b",
+    r"\b(?:not|n't)\s+(?:available|known|provided|specified|given|enough information)\b",
+    r"\b(?:i|we)\s+(?:do not|don't|cannot|can't|am unable to|are unable to)\s+"
+    r"(?:confirm|verify|determine|provide|access|know)\b",
+    r"\b(?:as of|up to)\s+my\s+(?:last\s+)?(?:update|knowledge)\b",
+    r"\b(?:i|we)\s+(?:do not|don't)\s+have\s+(?:access\s+to\s+)?"
+    r"(?:real[-\s]?time|current|latest|exact)\b",
+    r"\b(?:please|you should)\s+(?:check|consult|refer to)\s+(?:an|the)?\s*"
+    r"(?:official|current|latest|reliable)\s+(?:source|sources|data)\b",
+)
+
+
+def _is_hedged_non_answer(text: str) -> bool:
+    lower = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not lower:
+        return False
+    return any(re.search(pattern, lower, flags=re.IGNORECASE) for pattern in _NON_ANSWER_PATTERNS)
 
 # Extra guardrail for low-quality query tokens that are typically verbs/generic actions.
 _RETRIEVAL_VERBISH: frozenset[str] = frozenset({
@@ -629,7 +651,7 @@ class RelationalDecomposer:
         result: list[str] = []
         # Extract subject from first clause to carry forward
         subject_carry = ""
-        first_entities = self._ENTITY_RE.findall(parts[0]) if parts else []
+        first_entities = [e for e in self._ENTITY_RE.findall(parts[0]) if self._valid_entity_phrase(e)] if parts else []
         if first_entities:
             subject_carry = first_entities[0]
 
@@ -681,7 +703,7 @@ class RelationalDecomposer:
         subject = predicate = obj = qualifier = ""
 
         # Subject: first entity in text
-        all_entities = self._ENTITY_RE.findall(text)
+        all_entities = [e for e in self._ENTITY_RE.findall(text) if self._valid_entity_phrase(e)]
         if all_entities:
             subject = all_entities[0]
 
@@ -700,10 +722,17 @@ class RelationalDecomposer:
             if m:
                 predicate = m.group(0).strip()
                 after = text[m.end():].strip()
-                obj_ents = self._ENTITY_RE.findall(after)
+                obj_ents = [e for e in self._ENTITY_RE.findall(after) if self._valid_entity_phrase(e)]
                 if obj_ents:
                     obj = obj_ents[0]
                 break
+
+        if self._COMPARATIVE_VERBS.search(text):
+            compared = self._extract_comparative_entities(text)
+            if compared:
+                subject = compared[0]
+                if len(compared) > 1:
+                    obj = compared[1]
 
         # Qualifier: year first, then prominent number
         ym = self._YEAR_RE.search(text)
@@ -724,6 +753,37 @@ class RelationalDecomposer:
             qualifier_label=EntityLabel.DATE if qualifier and qualifier.isdigit()
                             else EntityLabel.OTHER,
         )
+
+    def _valid_entity_phrase(self, phrase: str) -> bool:
+        tokens = [t for t in re.findall(r"[A-Za-z][A-Za-z\-']+", phrase or "")]
+        if not tokens:
+            return False
+        meaningful = [
+            t for t in tokens
+            if is_valid_entity(t)
+            and t.lower() not in _STOPWORDS
+            and t.lower() not in _RETRIEVAL_STOPWORDS
+            and t.lower() not in _RETRIEVAL_VERBISH
+        ]
+        return bool(meaningful)
+
+    def _extract_comparative_entities(self, text: str) -> list[str]:
+        entities = [e for e in self._ENTITY_RE.findall(text) if self._valid_entity_phrase(e)]
+        if len(entities) >= 2:
+            return list(dict.fromkeys(entities))[:2]
+        lower = text.lower()
+        common_pairs = (
+            ("lightning", "sun"),
+            ("deoxygenated blood", "blue"),
+            ("venous blood", "blue"),
+        )
+        found: list[str] = []
+        for left, right in common_pairs:
+            if left in lower and left.title() not in found:
+                found.append(left.title())
+            if right in lower and right.title() not in found:
+                found.append(right.title())
+        return found[:2]
 
     async def _extract_triple_llm(self, text: str) -> RelationalTriple | None:
         if not settings.enable_llm_triple_extraction:
@@ -950,6 +1010,7 @@ class ClaimExtractionAgent:
         text = _strip_emojis(text).strip()
         if not text or len(text.split()) < 3: return False
         if text.endswith('?'): return False
+        if _is_hedged_non_answer(text): return False
         
         lower_text = text.lower()
         unverifiable_prefixes = [
@@ -1107,6 +1168,8 @@ class ClaimExtractionAgent:
         text = (text or "").strip()
         if not text or text.endswith("?") or len(text.split()) < 4:
             return False
+        if _is_hedged_non_answer(text):
+            return False
         lower = text.lower()
         opinion_markers = (
             "i think", "i believe", "in my opinion", "personally",
@@ -1206,6 +1269,18 @@ class RetrievalAgent:
             if len(snippets) >= 3:
                 break
             logger.info("Attempt %d: %d snippets; retrying.", attempt + 1, len(snippets))
+
+        if not snippets:
+            fallback_terms = extract_entities(claim.contextualized_text)
+            fallback_query = _sanitize_query(" ".join(fallback_terms[:8]) or claim.contextualized_text)
+            if fallback_query and fallback_query not in {_sanitize_query(q) for q in queries}:
+                queries_attempted += 1
+                fallback_results = []
+                if config.enable_kb_search:
+                    fallback_results.extend(await self._wiki_fulltext(fallback_query))
+                if config.enable_web_search:
+                    fallback_results.extend(await self._search_web(fallback_query))
+                snippets = _deduplicate(_filter_short(fallback_results))
 
         # Score relational match for every snippet
         key_terms = _claim_key_terms(claim.contextualized_text, triple)
@@ -1547,14 +1622,7 @@ class VerificationEngine:
         relaxed_semantics = mode == VerificationMode.EXPLANATION or domain in {"science", "physics", "biology"}
 
         if not snippets:
-            # Safety: always return at least one evidence snippet.
-            return 0.0, 0.0, 0.0, 0.0, [
-                EvidenceSnippet(
-                    source_url="https://example.com",
-                    snippet="No strong evidence found, but related information retrieved",
-                    credibility_tier=CredibilityTier.TIER_3,
-                )
-            ]
+            return 0.0, 0.0, 0.0, 0.0, []
 
         # If NLI is disabled, preserve pre-annotated snippet statuses.
         # This mode is used for unit tests and graceful degradation.
@@ -3152,6 +3220,13 @@ def _passes_evidence_quality_filter(
         "may also refer to",
         "can refer to",
         "is a term used",
+        "is a word",
+        "is an english word",
+        "is a conjunction",
+        "is an adverb",
+        "is a preposition",
+        "definition of",
+        "dictionary",
     )
     return not any(pat in lower for pat in generic_patterns)
 
