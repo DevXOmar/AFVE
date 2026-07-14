@@ -353,12 +353,65 @@ _NON_ANSWER_PATTERNS: tuple[str, ...] = (
     r"(?:official|current|latest|reliable)\s+(?:source|sources|data)\b",
 )
 
+_PRONOUN_SUBJECTS: frozenset[str] = frozenset({
+    "it", "this", "that", "things", "thing", "they", "these", "those",
+})
+
+_VAGUE_PREDICATE_TERMS: frozenset[str] = frozenset({
+    "work", "works", "working", "differ", "differs", "different",
+    "differently", "like", "similar",
+})
+
 
 def _is_hedged_non_answer(text: str) -> bool:
     lower = re.sub(r"\s+", " ", (text or "").strip().lower())
     if not lower:
         return False
     return any(re.search(pattern, lower, flags=re.IGNORECASE) for pattern in _NON_ANSWER_PATTERNS)
+
+
+def _strip_code_for_claim_extraction(text: str) -> str:
+    text = re.sub(r"```[\s\S]*?```", " ", text or "")
+    text = re.sub(r"`[^`\n]+`", " ", text)
+    return text
+
+
+def _looks_like_code_fragment(text: str) -> bool:
+    lower = (text or "").lower()
+    code_hits = sum(
+        1 for pattern in (
+            r"\bimport\s+\w+",
+            r"\bfrom\s+\w+\s+import\b",
+            r"\bdef\s+\w+\s*\(",
+            r"\bclass\s+\w+",
+            r"\bprint\s*\(",
+            r"@\w+",
+            r"==|!=|<=|>=",
+            r"\w+\s*=\s*[^=]",
+        )
+        if re.search(pattern, lower)
+    )
+    bracket_density = sum(1 for c in text or "" if c in "{}[]();") / max(len(text or ""), 1)
+    return code_hits >= 2 or bracket_density > 0.08
+
+
+def _normalized_claim_key(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", (text or "").lower())).strip()
+
+
+def _is_pronoun_or_empty_subject(subject: str) -> bool:
+    normalized = re.sub(r"[^a-z\s]", "", (subject or "").lower()).strip()
+    return not normalized or normalized in _PRONOUN_SUBJECTS
+
+
+def _is_content_free_triple(analysis: RelationalAnalysis | None) -> bool:
+    if not analysis:
+        return True
+    triple = analysis.triple
+    if not _is_pronoun_or_empty_subject(triple.subject):
+        return False
+    terms = set(_content_tokens(f"{triple.predicate} {triple.object} {triple.qualifier}"))
+    return not terms or bool(terms & _VAGUE_PREDICATE_TERMS)
 
 # Extra guardrail for low-quality query tokens that are typically verbs/generic actions.
 _RETRIEVAL_VERBISH: frozenset[str] = frozenset({
@@ -644,6 +697,8 @@ class RelationalDecomposer:
     # ------------------------------------------------------------------
 
     def _split_compound(self, text: str) -> list[str]:
+        if re.search(r"\b[a-z][a-z\-]+\s+and\s+[a-z][a-z\-]+\s+(?:are|were|do|have|share|descend)\b", text or "", re.IGNORECASE):
+            return [text]
         parts = self._COMPOUND_RE.split(text)
         if len(parts) == 1:
             return parts
@@ -701,11 +756,23 @@ class RelationalDecomposer:
         Qualifier = year or number modifier.
         """
         subject = predicate = obj = qualifier = ""
+        polarity = "negative" if self._has_negation(text) else "positive"
 
         # Subject: first entity in text
         all_entities = [e for e in self._ENTITY_RE.findall(text) if self._valid_entity_phrase(e)]
         if all_entities:
             subject = all_entities[0]
+        if not subject:
+            m = re.match(
+                r"^\s*(?:no,\s*)?([a-z][a-z\s\-]{2,80}?)\s+"
+                r"(?:is|are|was|were|has|have|does|do|did|can|could|may|might)\b",
+                text or "",
+                flags=re.IGNORECASE,
+            )
+            if m:
+                candidate = re.sub(r"\s+", " ", m.group(1)).strip(" ,.;:")
+                if candidate and not _is_pronoun_or_empty_subject(candidate):
+                    subject = candidate
 
         # Predicate + object: match verb patterns in priority order
         verb_patterns = [
@@ -752,7 +819,11 @@ class RelationalDecomposer:
             qualifier=qualifier,
             qualifier_label=EntityLabel.DATE if qualifier and qualifier.isdigit()
                             else EntityLabel.OTHER,
+            polarity=polarity,
         )
+
+    def _has_negation(self, text: str) -> bool:
+        return bool(re.search(r"\b(no|not|never|isn't|aren't|wasn't|weren't|doesn't|don't|didn't|cannot|can't)\b|n't\b", text or "", re.IGNORECASE))
 
     def _valid_entity_phrase(self, phrase: str) -> bool:
         tokens = [t for t in re.findall(r"[A-Za-z][A-Za-z\-']+", phrase or "")]
@@ -807,6 +878,7 @@ class RelationalDecomposer:
                 object=d.get("object", ""),
                 object_label=self._label(d.get("object", "")),
                 qualifier=d.get("qualifier", ""),
+                polarity="negative" if self._has_negation(text) else "positive",
             )
         except Exception as exc:
             logger.debug("LLM triple extraction failed: %s", exc)
@@ -1011,6 +1083,7 @@ class ClaimExtractionAgent:
         if not text or len(text.split()) < 3: return False
         if text.endswith('?'): return False
         if _is_hedged_non_answer(text): return False
+        if _looks_like_code_fragment(text): return False
         
         lower_text = text.lower()
         unverifiable_prefixes = [
@@ -1028,6 +1101,7 @@ class ClaimExtractionAgent:
 
     def _split_sentences(self, text: str) -> list[RawClaim]:
         import re
+        text = _strip_code_for_claim_extraction(text)
         pat = re.compile(r"(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|!)\s")
         parts = pat.split(text.strip())
         claims: list[RawClaim] = []
@@ -1135,6 +1209,8 @@ class ClaimExtractionAgent:
             for atom in res:
                 if atom.analysis and atom.analysis.claim_category == ClaimCategory.ABSTRACT and _is_analogy_or_stylistic(atom.atomic_text.lower()):
                     continue
+                if _is_content_free_triple(atom.analysis):
+                    continue
                 relevance = _claim_relevance_score(request.prompt, atom.atomic_text, atom.analysis)
                 if relevance < 0.20:
                     continue
@@ -1150,6 +1226,13 @@ class ClaimExtractionAgent:
                 ))
 
         claims = _dedupe_claims(claims)
+        by_norm: dict[str, ResolvedClaim] = {}
+        for claim in claims:
+            key = _normalized_claim_key(claim.contextualized_text)
+            if key and key not in by_norm:
+                by_norm[key] = claim
+        claims = list(by_norm.values())
+        assert len({_normalized_claim_key(c.contextualized_text) for c in claims}) == len(claims)
         claims.sort(
             key=lambda c: (
                 c.claim_weight,
@@ -1715,7 +1798,7 @@ class VerificationEngine:
         if getattr(config, "enable_nli", True):
             nli_hyp = _build_hypothesis(triple, claim_text)
             import asyncio
-            tasks = [asyncio.to_thread(self._score_snippet_sync, nli_hyp, s) for s in selected]
+            tasks = [asyncio.to_thread(self._score_snippet_sync, nli_hyp, s, triple) for s in selected]
             annotated = list(await asyncio.gather(*tasks))
             
             # Sort by NLI score (if SUPPORTS, score + 1.0) and semantic score.
@@ -1757,7 +1840,7 @@ class VerificationEngine:
 
         return nli_agg, llm_agg, source_weight, cross_agreement, annotated
 
-    def _score_snippet_sync(self, nli_hyp: str, snippet: EvidenceSnippet) -> EvidenceSnippet:
+    def _score_snippet_sync(self, nli_hyp: str, snippet: EvidenceSnippet, triple: RelationalTriple | None = None) -> EvidenceSnippet:
         # Load NLI correctly from the global single instance
         pipeline = _get_nli_pipeline()
         numeric_result = _compare_numeric_texts(nli_hyp, snippet.snippet)
@@ -1881,6 +1964,11 @@ class VerificationEngine:
                 status = EntailmentStatus.NEUTRAL
                 score = 0.5
 
+        triple = triple or RelationalTriple()
+        if _is_pronoun_or_empty_subject(triple.subject) and status == EntailmentStatus.SUPPORTS:
+            status = EntailmentStatus.NEUTRAL
+            score = min(score, 0.5)
+        status, score = _apply_polarity_to_entailment(status, score, triple)
         snippet.entailment_status = status
         snippet.nli_score = score
         snippet.llm_judge_score = 0.0
@@ -2630,7 +2718,9 @@ def _score_predicate(
 
 def _build_hypothesis(triple: RelationalTriple, fallback: str) -> str:
     if triple.subject and triple.predicate:
-        h = f"{triple.subject} {triple.predicate}"
+        predicate = re.sub(r"\b(no|not|never|isn't|aren't|wasn't|weren't|doesn't|don't|didn't|cannot|can't)\b|n't\b", "", triple.predicate, flags=re.IGNORECASE)
+        predicate = re.sub(r"\s+", " ", predicate).strip()
+        h = f"{triple.subject} {predicate}"
         if triple.object:
             h += f" {triple.object}"
         if triple.qualifier:
@@ -2772,6 +2862,8 @@ def _detect_claim_polarity(text: str) -> str:
         r"\bno such\b",
         r"\bnever existed\b",
         r"\bhas no\b",
+        r"\bdoes not have\b",
+        r"\bdo not have\b",
     )
     if any(re.search(pattern, lower) for pattern in negative_patterns):
         return "negative"
@@ -2795,11 +2887,13 @@ def _extract_target_entity(text: str, triple: RelationalTriple | None = None) ->
         r"\bthere is a[n]?\s+(.+?)(?:[.!?]|$)",
         r"\b([a-z0-9\s'\-]+?)\s+does not exist\b",
         r"\b([a-z0-9\s'\-]+?)\s+never existed\b",
+        r"\b([a-z0-9\s'\-]+?)\s+does not have\s+(?:a|an|the)?\s*(?:built[-\s]?in|native|standard)?\s*(?:module|function|feature|method|api|package|library)\s+named\s+['\"]?([a-z0-9_\-\s]+)['\"]?\b",
     )
     for pattern in patterns:
         match = re.search(pattern, lower, flags=re.IGNORECASE)
         if match:
-            candidate = re.sub(r"\s+", " ", match.group(1)).strip(" .,!?:;")
+            candidate = " ".join(g for g in match.groups() if g)
+            candidate = re.sub(r"\s+", " ", candidate).strip(" .,!?:;'\"")
             if candidate:
                 return candidate
     if triple:
@@ -2824,6 +2918,15 @@ def _is_impossible_entity(target_entity: str, claim_text: str) -> tuple[bool, st
     if any(figure in claim_lower for figure in _HISTORICAL_FIGURES) and any(term in claim_lower for term in _MODERN_TECH_TERMS):
         if re.search(r"\b(invented|created|developed|built)\b", claim_lower):
             return True, "anachronistic creator-tech pairing"
+    software_negative = re.search(
+        r"\b(python|javascript|java|typescript|ruby|go|rust|node(?:\.js)?|php|swift|kotlin|c\+\+|c#)\s+"
+        r"(?:does not|doesn't|do not|don't)\s+have\s+(?:a|an|the)?\s*"
+        r"(?:built[-\s]?in|native|standard)?\s*"
+        r"(?:module|function|feature|method|api|package|library)\s+named\s+['\"]?[a-z0-9_\-\s]+['\"]?",
+        claim_lower,
+    )
+    if software_negative:
+        return True, "negative software/API existence claim"
     return False, ""
 
 
@@ -3553,6 +3656,20 @@ def _merge_entailment(
     if EntailmentStatus.SUPPORTS in (nli, llm):
         return EntailmentStatus.SUPPORTS
     return EntailmentStatus.SUPPORTS if bias_supports else EntailmentStatus.NEUTRAL
+
+
+def _apply_polarity_to_entailment(
+    status: EntailmentStatus,
+    score: float,
+    triple: RelationalTriple,
+) -> tuple[EntailmentStatus, float]:
+    if getattr(triple, "polarity", "positive") != "negative":
+        return status, score
+    if status == EntailmentStatus.SUPPORTS:
+        return EntailmentStatus.CONTRADICTS, min(score, 0.05)
+    if status == EntailmentStatus.CONTRADICTS:
+        return EntailmentStatus.SUPPORTS, max(score, 0.88)
+    return EntailmentStatus.WEAK_SUPPORT, max(score, 0.78)
 
 
 def _parse_status(raw: str) -> EntailmentStatus:

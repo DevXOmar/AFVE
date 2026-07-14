@@ -37,7 +37,7 @@ This revision replaces that with a proper relational triple model:
 from __future__ import annotations
 
 from enum import Enum
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
@@ -184,6 +184,7 @@ class RelationalTriple(BaseModel):
     object_label: EntityLabel = EntityLabel.OTHER
     qualifier: str = ""          # e.g. "in 2003", "at $10 billion", "with 50,000 employees"
     qualifier_label: EntityLabel = EntityLabel.OTHER
+    polarity: Literal["positive", "negative"] = "positive"
 
 
 class NumericAssertion(BaseModel):

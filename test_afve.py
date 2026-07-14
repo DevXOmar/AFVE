@@ -944,6 +944,26 @@ class TestVerificationUtilities:
         assert score == 0.5
         assert label == VerificationLabel.UNCERTAIN
 
+    def test_software_negative_existence_assessment(self):
+        from agents import _assess_entity_existence
+        from models import RetrievalResult, ResolvedClaim
+
+        claim = ResolvedClaim(
+            original_text="Python does not have a built-in module named 'HyperCache.'",
+            contextualized_text="Python does not have a built-in module named 'HyperCache.'",
+            sentence_index=0,
+        )
+        retrieval = RetrievalResult(
+            claim=claim,
+            snippets=[],
+            queries_attempted=1,
+            retrieval_success=False,
+        )
+        assessment = _assess_entity_existence(claim, retrieval, [])
+        assert assessment.status == "non_existent"
+        assert assessment.claim_polarity == "negative"
+        assert "software" in assessment.reason
+
 
 # ===========================================================================
 # UNIT TESTS — Credibility inference utility
@@ -1921,6 +1941,105 @@ class TestEdgeCases:
         from models import _score_to_rating
 
         assert _score_to_rating(20.0) == "Insufficient Evidence"
+
+    @pytest.mark.asyncio
+    async def test_extract_dedupes_duplicate_atomic_claims(self):
+        from agents import ClaimExtractionAgent
+        from models import AtomicClaim, ClaimType, RelationalAnalysis, RelationalTriple, VerificationRequest
+
+        class DuplicateDecomposer:
+            async def decompose(self, text, sentence_index, config):
+                analysis = RelationalAnalysis(
+                    claim_type=ClaimType.GENERAL,
+                    triple=RelationalTriple(subject="Gravity", predicate="is", object="force"),
+                    atomic_claim_text="Gravity is one of the four fundamental forces.",
+                )
+                return [
+                    AtomicClaim(original_sentence=text, atomic_text="Gravity is one of the four fundamental forces.", sentence_index=sentence_index, atom_index=0, analysis=analysis),
+                    AtomicClaim(original_sentence=text, atomic_text="Gravity is one of the four fundamental forces!", sentence_index=sentence_index, atom_index=1, analysis=analysis),
+                ]
+
+        req = VerificationRequest(
+            job_id=make_uuid(),
+            prompt="Explain gravity.",
+            model_output="Gravity is one of the four fundamental forces.",
+        )
+        claims = await ClaimExtractionAgent(decomposer=DuplicateDecomposer()).extract(req)
+        normalized = [
+            " ".join(claim.contextualized_text.lower().replace("!", "").replace(".", "").split())
+            for claim in claims
+        ]
+        assert normalized.count("gravity is one of the four fundamental forces") == 1
+
+    def test_negative_polarity_flips_positive_entailment(self):
+        from agents import _apply_polarity_to_entailment
+        from models import EntailmentStatus, RelationalTriple
+
+        status, score = _apply_polarity_to_entailment(
+            EntailmentStatus.SUPPORTS,
+            0.95,
+            RelationalTriple(subject="Sun", predicate="classified as", object="planet", polarity="negative"),
+        )
+        assert status == EntailmentStatus.CONTRADICTS
+        assert score <= 0.05
+
+        status, score = _apply_polarity_to_entailment(
+            EntailmentStatus.NEUTRAL,
+            0.5,
+            RelationalTriple(subject="Sun", predicate="classified as", object="planet", polarity="negative"),
+        )
+        assert status == EntailmentStatus.WEAK_SUPPORT
+        assert score >= 0.78
+
+    @pytest.mark.asyncio
+    async def test_lowercase_negative_subject_survives_extraction(self):
+        from agents import ClaimExtractionAgent
+        from models import VerificationRequest
+
+        req = VerificationRequest(
+            job_id=make_uuid(),
+            prompt="Are humans descended from chimpanzees?",
+            model_output="No, humans and chimpanzees are not descended from each other.",
+        )
+        claims = await ClaimExtractionAgent().extract(req)
+        assert claims
+        assert claims[0].analysis is not None
+        assert claims[0].analysis.triple.polarity == "negative"
+        assert "humans" in claims[0].analysis.triple.subject.lower()
+
+    @pytest.mark.asyncio
+    async def test_code_blocks_are_not_extracted_as_claims(self):
+        from agents import ClaimExtractionAgent
+        from models import VerificationRequest
+
+        req = VerificationRequest(
+            job_id=make_uuid(),
+            prompt="Explain HyperCache.",
+            model_output=(
+                "Here is an example:\n```python\n"
+                "from cachetools import LRUCache\n"
+                "def compute_expensive_operation(x):\n"
+                "    print(compute_expensive_operation(5))\n"
+                "```\n"
+            ),
+        )
+        claims = await ClaimExtractionAgent().extract(req)
+        assert all("```" not in claim.contextualized_text for claim in claims)
+        assert all("import " not in claim.contextualized_text for claim in claims)
+        assert all("print(" not in claim.contextualized_text for claim in claims)
+
+    @pytest.mark.asyncio
+    async def test_content_free_transition_sentence_is_rejected(self):
+        from agents import ClaimExtractionAgent
+        from models import VerificationRequest
+
+        req = VerificationRequest(
+            job_id=make_uuid(),
+            prompt="Explain quantum mechanics.",
+            model_output="But in quantum mechanics, things work quite differently.",
+        )
+        claims = await ClaimExtractionAgent().extract(req)
+        assert claims == []
 
     @pytest.mark.asyncio
     async def test_score_calibrator_precision(self):
